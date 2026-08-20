@@ -1,0 +1,29 @@
+# Optional TUIC egress for Sub2API.
+#
+# Usage:
+#   cp tuic/sing-box.example.json tuic/config.json
+#   chmod 600 tuic/config.json
+#   docker compose -f docker-compose.yml -f docker-compose.tuic.yml \
+#     --profile tuic up -d
+#
+# In the Sub2API proxy form use socks5h://sub2api:<password>@sing-box:1080.
+
+services:
+  sing-box:
+    image: ${SING_BOX_IMAGE:-ghcr.io/sagernet/sing-box:v1.12.15}
+    container_name: sub2api-sing-box
+    profiles: ["tuic"]
+    restart: unless-stopped
+    command: ["run", "-c", "/etc/sing-box/config.json"]
+    volumes:
+      - ./tuic/config.json:/etc/sing-box/config.json:ro
+    networks:
+      - sub2api-network
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+

@@ -140,6 +140,7 @@ docs/*
 !docs/README.md
 !docs/PAYMENT.md
 !docs/PAYMENT_CN.md
+!docs/TUIC_CN.md
 !docs/ADMIN_PAYMENT_INTEGRATION_API.md
 !docs/ASYNC_IMAGE_TASKS.md
 !docs/legal/
@@ -149,6 +150,11 @@ docs/*
 frontend/coverage/
 aicodex
 output/
+
+# Optional TUIC/sing-box sidecar credentials. Keep only the redacted example.
+deploy/tuic/config.json
+deploy/tuic/*.pem
+deploy/tuic/*.key
 
 # Vitest / Vite cache at repo root
 .vite/

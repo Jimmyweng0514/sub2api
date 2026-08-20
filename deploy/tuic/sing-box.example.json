@@ -1,0 +1,42 @@
+{
+  "log": {
+    "level": "info",
+    "timestamp": true
+  },
+  "inbounds": [
+    {
+      "type": "socks",
+      "tag": "sub2api-socks",
+      "listen": "0.0.0.0",
+      "listen_port": 1080,
+      "users": [
+        {
+          "username": "sub2api",
+          "password": "REPLACE_WITH_A_LONG_RANDOM_PASSWORD"
+        }
+      ]
+    }
+  ],
+  "outbounds": [
+    {
+      "type": "tuic",
+      "tag": "tuic-egress",
+      "server": "tuic.example.com",
+      "server_port": 443,
+      "uuid": "00000000-0000-4000-8000-000000000000",
+      "password": "REPLACE_WITH_TUIC_PASSWORD",
+      "congestion_control": "bbr",
+      "udp_relay_mode": "native",
+      "zero_rtt_handshake": false,
+      "heartbeat": "10s",
+      "tls": {
+        "enabled": true,
+        "server_name": "tuic.example.com",
+        "insecure": false
+      }
+    }
+  ],
+  "route": {
+    "final": "tuic-egress"
+  }
+}
