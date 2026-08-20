@@ -90,7 +90,6 @@ func TestUpstreamModelMismatchTreatsGrokBuildRuntimeIDsAsAliases(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mismatch := upstreamModelMismatch(tt.sentModel, tt.responseModel)
-
 			require.NotNil(t, mismatch)
 			require.False(t, *mismatch)
 		})
@@ -118,12 +117,16 @@ func TestUpstreamModelMismatchDoesNotCollapseDifferentModels(t *testing.T) {
 			sentModel:     "grok-build-0.1",
 			responseModel: "grok-4.5-build",
 		},
+		{
+			name:          "unknown grok build suffix",
+			sentModel:     "grok-4.6",
+			responseModel: "grok-4.6-custom-build",
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			mismatch := upstreamModelMismatch(tt.sentModel, tt.responseModel)
-
 			require.NotNil(t, mismatch)
 			require.True(t, *mismatch)
 		})

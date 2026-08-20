@@ -51,9 +51,9 @@ func (s *OpenAIGatewayService) ForwardAlphaSearch(ctx context.Context, c *gin.Co
 		return nil, err
 	}
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveRequiredOpenAIProxyURL(account)
+	if proxyErr != nil {
+		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, proxyErr, true)
 	}
 	if err := s.ensureOpenAIAlphaSearchAuthMetadata(ctx, account, token, proxyURL); err != nil {
 		return nil, err
@@ -235,10 +235,10 @@ func (s *OpenAIGatewayService) buildOpenAIAlphaSearchResponsesWebSearchRequest(c
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
+	canonical := resolveCodexOutboundIdentity("")
 	if turnMetadata := openAIAlphaSearchInboundHeader(c, "X-Codex-Turn-Metadata"); turnMetadata != "" {
 		req.Header.Set("X-Codex-Turn-Metadata", turnMetadata)
 	}
-	canonical := resolveCodexOutboundIdentity("")
 	if version := openAIAlphaSearchInboundHeader(c, "Version"); version != "" {
 		req.Header.Set("Version", version)
 	} else {
@@ -374,6 +374,7 @@ func (s *OpenAIGatewayService) buildOpenAIAlphaSearchRequest(ctx context.Context
 	req.Header.Set("Accept", "application/json")
 
 	if account.Type == AccountTypeOAuth {
+		canonical := resolveCodexOutboundIdentity("")
 		req.Host = "chatgpt.com"
 		if err := resolveAndSetOpenAIChatGPTAccountHeaders(ctx, s.accountRepo, req.Header, account); err != nil {
 			return nil, fmt.Errorf("resolve chatgpt account headers: %w", err)
@@ -382,7 +383,6 @@ func (s *OpenAIGatewayService) buildOpenAIAlphaSearchRequest(ctx context.Context
 		if turnMetadata := openAIAlphaSearchInboundHeader(c, "X-Codex-Turn-Metadata"); turnMetadata != "" {
 			req.Header.Set("X-Codex-Turn-Metadata", turnMetadata)
 		}
-		canonical := resolveCodexOutboundIdentity("")
 		if version := openAIAlphaSearchInboundHeader(c, "Version"); version != "" {
 			req.Header.Set("Version", version)
 		} else {
@@ -417,9 +417,8 @@ func (s *OpenAIGatewayService) buildOpenAIAlphaSearchRequest(ctx context.Context
 // OpenAI-Beta、会话隔离或 Responses Lite 状态头。originator 与 User-Agent
 // 属于官方默认客户端头，必须保留。
 //
-// alpha/search 使用专用构造器生成官方 SearchClient 的最小线协议形态；
-// 该函数作为最后一道防线，避免账号 header 覆写或后续改动重新带入
-// Responses 专用头，使 PAT 的 alpha/search 被上游按错误认证路径处理。
+// alpha/search uses a separate SearchClient protocol rather than a Responses
+// sub-request. Remove Responses-only headers after all account overrides.
 func stripOpenAIAlphaSearchResponsesHeaders(headers http.Header) {
 	if headers == nil {
 		return

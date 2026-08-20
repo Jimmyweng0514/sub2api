@@ -333,7 +333,7 @@ func (s *AuthService) SendVerifyCode(ctx context.Context, email string, locale .
 	}
 
 	// 获取网站名称
-	siteName := "Sub2API"
+	siteName := "Sub2API Plus"
 	if s.settingService != nil {
 		siteName = s.settingService.GetSiteName(ctx)
 	}
@@ -375,7 +375,7 @@ func (s *AuthService) SendVerifyCodeAsync(ctx context.Context, email string, loc
 	}
 
 	// 获取网站名称
-	siteName := "Sub2API"
+	siteName := "Sub2API Plus"
 	if s.settingService != nil {
 		siteName = s.settingService.GetSiteName(ctx)
 	}
@@ -1292,15 +1292,18 @@ func (s *AuthService) createUserAndClaimInvitation(ctx context.Context, user *Us
 		if invitation == nil {
 			return nil
 		}
-		// createUserWithRegistrationEmailGuard 会回填 user.ID（applyUserEntityToService），
-		// 直接以其原子占用邀请码；占用失败即整体回滚（含用户创建，见 user_repo.create
-		// 对外部事务的复用）。
 		if err := s.redeemRepo.Use(execCtx, invitation.ID, user.ID); err != nil {
-			// 并发下唯一的合法失败路径：另一个注册已占用该码
-			logger.LegacyPrintf("service.auth",
-				"[Auth] Rejected registration: invitation code %s already claimed (user_id=%d err=%v)",
-				invitation.Code, user.ID, err)
-			return ErrInvitationCodeInvalid
+			logger.LegacyPrintf(
+				"service.auth",
+				"[Auth] Failed to claim invitation code %s (user_id=%d err=%v)",
+				invitation.Code,
+				user.ID,
+				err,
+			)
+			if errors.Is(err, ErrRedeemCodeUsed) || errors.Is(err, ErrRedeemCodeNotFound) {
+				return ErrInvitationCodeInvalid
+			}
+			return err
 		}
 		return nil
 	}
@@ -1308,6 +1311,9 @@ func (s *AuthService) createUserAndClaimInvitation(ctx context.Context, user *Us
 	if invitation == nil {
 		return commitUser(ctx)
 	}
+	// Tests and legacy embedding paths may construct AuthService without the
+	// database client. Preserve their sequential behavior; production wiring
+	// always supplies entClient, which enables the atomic path above.
 	if s.entClient == nil {
 		return commitUser(ctx)
 	}
@@ -1320,6 +1326,7 @@ func (s *AuthService) createUserAndClaimInvitation(ctx context.Context, user *Us
 	defer func() { _ = tx.Rollback() }()
 	execCtx := dbent.NewTxContext(ctx, tx)
 	if err := commitUser(execCtx); err != nil {
+		_ = tx.Rollback()
 		return err
 	}
 	if err := tx.Commit(); err != nil {
@@ -1551,7 +1558,7 @@ func (s *AuthService) preparePasswordReset(ctx context.Context, email, frontendB
 	}
 
 	// Get site name
-	siteName := "Sub2API"
+	siteName := "Sub2API Plus"
 	if s.settingService != nil {
 		siteName = s.settingService.GetSiteName(ctx)
 	}

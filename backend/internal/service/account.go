@@ -87,6 +87,11 @@ type OpenAIEndpointCapability string
 
 const openAILongContextBillingEnabledKey = "openai_long_context_billing_enabled"
 
+// OpenAICodex429GuardEnabledExtraKey controls the opt-in Codex-only history
+// checkpoint used by the 429 guard (the UI calls this "奸商模式"). Missing
+// values stay disabled so existing accounts do not change behavior silently.
+const OpenAICodex429GuardEnabledExtraKey = "openai_codex_429_guard_enabled"
+
 const (
 	OpenAIEndpointCapabilityChatCompletions OpenAIEndpointCapability = "chat_completions"
 	OpenAIEndpointCapabilityEmbeddings      OpenAIEndpointCapability = "embeddings"
@@ -181,6 +186,9 @@ func (a *Account) IsSchedulable() bool {
 	if !a.IsActive() || !a.Schedulable {
 		return false
 	}
+	if a.HasFailedHealthProbe() {
+		return false
+	}
 	now := time.Now()
 	if a.AutoPauseOnExpired && a.ExpiresAt != nil && !now.Before(*a.ExpiresAt) {
 		return false
@@ -192,7 +200,9 @@ func (a *Account) IsSchedulable() bool {
 		return false
 	}
 	if a.TempUnschedulableUntil != nil && now.Before(*a.TempUnschedulableUntil) {
-		return false
+		if !a.HasAvailableCodexCredits() || !IsAccountSchedulingThresholdReason(a.TempUnschedulableReason) {
+			return false
+		}
 	}
 	if a.IsAPIKeyOrBedrock() && a.IsQuotaExceeded() {
 		return false
@@ -897,7 +907,16 @@ func (a *Account) OpenAICompactSupportKnown() (supported bool, known bool) {
 	if a.Extra == nil {
 		return false, false
 	}
-	supported, ok := a.Extra["openai_compact_supported"].(bool)
+	// A legacy explicit negative remains a safe scheduling veto even when its
+	// probe snapshot predates the strict v2 protocol marker. Positive results
+	// still require a current v2 snapshot before they can enable compact.
+	if supported, ok := a.Extra[openAICompactProbeSupportedExtraKey].(bool); ok && !supported {
+		return false, true
+	}
+	if !openAICompactProbeSnapshotFresh(a.Extra, time.Now().UTC()) {
+		return false, false
+	}
+	supported, ok := a.Extra[openAICompactProbeSupportedExtraKey].(bool)
 	if !ok {
 		return false, false
 	}
@@ -1279,6 +1298,60 @@ func (a *Account) IsOpenAIOAuth() bool {
 	return a.IsOpenAI() && a.Type == AccountTypeOAuth
 }
 
+// HasAvailableCodexCredits reports whether the latest /wham/usage snapshot
+// explicitly says this ordinary Codex OAuth account can spend paid credits.
+// Spark shadows do not consume the parent account's paid-credit balance.
+func (a *Account) HasAvailableCodexCredits() bool {
+	return a.hasAvailableCodexCreditsAt(time.Now().UTC())
+}
+
+func (a *Account) hasAvailableCodexCreditsAt(now time.Time) bool {
+	if a == nil || !a.IsOpenAIOAuth() || a.IsShadow() || a.QuotaDimensionOrDefault() == QuotaDimensionSpark || len(a.Extra) == 0 {
+		return false
+	}
+	raw, ok := a.Extra[openaiQuotaCreditBalanceKey]
+	if !ok || raw == nil {
+		return false
+	}
+	var snapshot *OpenAICodexCreditSnapshot
+	switch value := raw.(type) {
+	case *OpenAICodexCreditSnapshot:
+		snapshot = value
+	case OpenAICodexCreditSnapshot:
+		snapshot = &value
+	case map[string]any:
+		snapshot = &OpenAICodexCreditSnapshot{
+			OpenAICodexCredits: OpenAICodexCredits{
+				HasCredits:          resolveAccountExtraBool(value, "has_credits"),
+				Unlimited:           resolveAccountExtraBool(value, "unlimited"),
+				OverageLimitReached: resolveAccountExtraBool(value, "overage_limit_reached"),
+				Balance:             firstStringValue(value, "balance"),
+			},
+			UpdatedAt: firstStringValue(value, "updated_at"),
+		}
+	default:
+		return false
+	}
+	if snapshot == nil || strings.TrimSpace(snapshot.UpdatedAt) == "" {
+		return false
+	}
+	updatedAt, err := parseTime(snapshot.UpdatedAt)
+	if err != nil || updatedAt.After(now.Add(time.Minute)) {
+		return false
+	}
+	if snapshot.OverageLimitReached {
+		return false
+	}
+	if snapshot.Unlimited {
+		return true
+	}
+	if !snapshot.HasCredits {
+		return false
+	}
+	balance, err := strconv.ParseFloat(strings.TrimSpace(snapshot.Balance), 64)
+	return err == nil && balance > 0
+}
+
 func (a *Account) IsOpenAIChatGPTSubscription() bool {
 	if !a.IsOpenAIOAuth() {
 		return false
@@ -1484,7 +1557,10 @@ func (a *Account) GetAnthropicProtocolBaseURL() string {
 // 端点，不能拿来拼 OpenAI 路径，此时返回该供应商 × 模式的 Chat Completions
 // 默认 base（模型同步等协议族共用路径仍可用）。
 func (a *Account) GetOpenAIFormatBaseURL() string {
-	if a == nil || !a.IsAnthropicProtocol() {
+	if a == nil {
+		return ""
+	}
+	if !a.IsAnthropicProtocol() {
 		return a.GetOpenAIBaseURL()
 	}
 	switch a.Platform {
@@ -1715,6 +1791,37 @@ func (a *Account) GetOpenAISessionID() string {
 	return strings.TrimSpace(a.GetExtraString("openai_session_id"))
 }
 
+func (a *Account) Codex429GuardEnabled() bool {
+	if a == nil || !a.IsOpenAIOAuth() || a.IsShadow() || a.QuotaDimensionOrDefault() == QuotaDimensionSpark {
+		return false
+	}
+	if a.Extra == nil {
+		return false
+	}
+	raw, exists := a.Extra[OpenAICodex429GuardEnabledExtraKey]
+	if !exists || raw == nil {
+		return false
+	}
+	switch value := raw.(type) {
+	case bool:
+		return value
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(value))
+		return err == nil && parsed
+	case json.Number:
+		parsed, err := strconv.ParseBool(value.String())
+		return err == nil && parsed
+	case float64:
+		return value != 0
+	case int:
+		return value != 0
+	case int64:
+		return value != 0
+	default:
+		return false
+	}
+}
+
 func (a *Account) SupportsOpenAIEndpointCapability(capability OpenAIEndpointCapability) bool {
 	if a == nil {
 		return false
@@ -1848,18 +1955,30 @@ func (a *Account) openAIEndpointCapabilitySet() (map[string]bool, bool) {
 		result[value] = true
 	}
 
+	// 空容器（{} / []）与未配置一致：不限制任何能力。
+	// 避免 OAuth 账号因 API 直写/导入/历史数据遗留的空对象而被调度器静默排除（#5530）。
+	// 注意：非空但全 false / 类型异常的数据仍视为「已配置且不含能力」，保持原行为。
 	switch capabilities := raw.(type) {
 	case []any:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for _, item := range capabilities {
 			if value, ok := item.(string); ok {
 				add(value)
 			}
 		}
 	case []string:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for _, value := range capabilities {
 			add(value)
 		}
 	case map[string]any:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for key, value := range capabilities {
 			enabled, ok := value.(bool)
 			if ok && enabled {
@@ -1867,6 +1986,9 @@ func (a *Account) openAIEndpointCapabilitySet() (map[string]bool, bool) {
 			}
 		}
 	case map[string]bool:
+		if len(capabilities) == 0 {
+			return nil, false
+		}
 		for key, enabled := range capabilities {
 			if enabled {
 				add(key)

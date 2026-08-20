@@ -612,6 +612,9 @@ func TestGetOpenAIFormatBaseURL_ProtocolAware(t *testing.T) {
 		Credentials: map[string]any{"base_url": "https://ds-relay.example.com"},
 	}
 	require.Equal(t, "https://ds-relay.example.com", ccAccount.GetOpenAIFormatBaseURL())
+
+	var nilAccount *Account
+	require.Empty(t, nilAccount.GetOpenAIFormatBaseURL())
 }
 
 // TestBuildUpstreamModelsRequest_AnthropicProtocol 模型同步使用协议感知 base。

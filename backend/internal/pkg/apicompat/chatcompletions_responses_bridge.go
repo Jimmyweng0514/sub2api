@@ -271,12 +271,8 @@ func buildChatMessagesFromItems(messages []ChatMessage, rawItems []json.RawMessa
 	// across an assistant message (so a following tool call in the same turn
 	// still receives it); any other role ends the thinking span.
 	var pendingReasoning string
-	// lastTurnReasoning is the most recent reasoning text of the current turn,
-	// surviving tool outputs. DeepSeek emits reasoning only once per turn, so
-	// chained tool calls (reasoning → call A → output A → call B) leave call B's
-	// assistant message without reasoning_content and DeepSeek 400s the history;
-	// replaying the turn's reasoning on B's message satisfies the contract. Only
-	// a user-side item ends the turn and clears it.
+	// lastTurnReasoning survives tool outputs within one turn so a later
+	// function call retains the reasoning_content expected by thinking models.
 	var lastTurnReasoning string
 	mediaByCallID := make(toolOutputMediaByCallID)
 
@@ -448,22 +444,15 @@ func buildChatMessagesFromItems(messages []ChatMessage, rawItems []json.RawMessa
 		if err != nil {
 			return nil, nil, err
 		}
-		msg := ChatMessage{Role: role, Content: chatContent}
-		// DeepSeek thinking mode requires the reasoning_content from a prior
-		// reasoning-only / plain-text assistant turn to be passed back on its
-		// assistant message; dropping it yields 400 "The `reasoning_content` in
-		// the thinking mode must be passed back to the API" on the next turn.
-		// A following function_call in the same turn still receives it because
-		// appendAssistantToolCall merges into this message and only fills
-		// ReasoningContent when it is still empty.
+		message := ChatMessage{Role: role, Content: chatContent}
 		if role == "assistant" {
-			msg.ReasoningContent = reasoningForAssistant()
+			message.ReasoningContent = reasoningForAssistant()
 			pendingReasoning = ""
 		} else {
 			pendingReasoning = ""
 			lastTurnReasoning = ""
 		}
-		messages = append(messages, msg)
+		messages = append(messages, message)
 	}
 
 	return messages, mediaByCallID, nil
@@ -1130,11 +1119,22 @@ func ChatCompletionsResponseToResponses(resp *ChatCompletionsResponse, model str
 		id = generateResponsesID()
 	}
 
+	// Carry the upstream's own creation timestamp when it sent one; otherwise
+	// stamp now, same fallback shape as the generated id above.
+	createdAt := int64(0)
+	if resp != nil {
+		createdAt = resp.Created
+	}
+	if createdAt <= 0 {
+		createdAt = time.Now().Unix()
+	}
+
 	out := &ResponsesResponse{
-		ID:     id,
-		Object: "response",
-		Model:  model,
-		Status: "completed",
+		ID:        id,
+		Object:    "response",
+		CreatedAt: createdAt,
+		Model:     model,
+		Status:    "completed",
 	}
 	if resp == nil {
 		out.Output = []ResponsesOutput{emptyResponsesMessageOutput()}
@@ -1581,6 +1581,7 @@ func FinalizeChatCompletionsResponsesStream(state *ChatCompletionsToResponsesStr
 		Response: &ResponsesResponse{
 			ID:                state.ResponseID,
 			Object:            "response",
+			CreatedAt:         state.Created,
 			Model:             state.Model,
 			Status:            status,
 			Output:            state.chatOutput(),
@@ -1598,11 +1599,12 @@ func ensureChatToResponsesCreated(state *ChatCompletionsToResponsesStreamState) 
 	state.CreatedSent = true
 	return []ResponsesStreamEvent{chatToResponsesEvent(state, "response.created", &ResponsesStreamEvent{
 		Response: &ResponsesResponse{
-			ID:     state.ResponseID,
-			Object: "response",
-			Model:  state.Model,
-			Status: "in_progress",
-			Output: []ResponsesOutput{},
+			ID:        state.ResponseID,
+			Object:    "response",
+			CreatedAt: state.Created,
+			Model:     state.Model,
+			Status:    "in_progress",
+			Output:    []ResponsesOutput{},
 		},
 	})}
 }

@@ -15,6 +15,7 @@ import (
 	"math"
 	mathrand "math/rand"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -609,9 +610,9 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 	geminiReq = ensureGeminiFunctionCallThoughtSignatures(geminiReq)
 	originalClaudeBody := body
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveConfiguredProxyURL(account)
+	if proxyErr != nil {
+		return nil, s.writeGoogleError(c, http.StatusBadGateway, "Configured account proxy is unavailable")
 	}
 
 	var requestIDHeader string
@@ -623,7 +624,7 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 	}
 
 	switch account.Type {
-	case AccountTypeAPIKey:
+	case AccountTypeAPIKey, AccountTypeUpstream:
 		buildReq = func(ctx context.Context) (*http.Request, string, error) {
 			apiKey := account.GetCredential("api_key")
 			if strings.TrimSpace(apiKey) == "" {
@@ -652,6 +653,11 @@ func (s *GeminiMessagesCompatService) Forward(ctx context.Context, c *gin.Contex
 			}
 			upstreamReq.Header.Set("Content-Type", "application/json")
 			upstreamReq.Header.Set("x-goog-api-key", apiKey)
+			if account.Type == AccountTypeUpstream {
+				upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
+				upstreamReq.Header.Set("x-api-key", apiKey)
+				account.ApplyHeaderOverrides(upstreamReq.Header)
+			}
 			return upstreamReq, "x-request-id", nil
 		}
 		requestIDHeader = "x-request-id"
@@ -1161,9 +1167,9 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 		mappedModel = account.GetMappedModel(originalModel)
 	}
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveConfiguredProxyURL(account)
+	if proxyErr != nil {
+		return nil, s.writeGoogleError(c, http.StatusBadGateway, "Configured account proxy is unavailable")
 	}
 
 	useUpstreamStream := stream
@@ -1179,7 +1185,7 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 	var buildReq func(ctx context.Context) (*http.Request, string, error)
 
 	switch account.Type {
-	case AccountTypeAPIKey:
+	case AccountTypeAPIKey, AccountTypeUpstream:
 		buildReq = func(ctx context.Context) (*http.Request, string, error) {
 			apiKey := account.GetCredential("api_key")
 			if strings.TrimSpace(apiKey) == "" {
@@ -1203,6 +1209,11 @@ func (s *GeminiMessagesCompatService) ForwardNative(ctx context.Context, c *gin.
 			}
 			upstreamReq.Header.Set("Content-Type", "application/json")
 			upstreamReq.Header.Set("x-goog-api-key", apiKey)
+			if account.Type == AccountTypeUpstream {
+				upstreamReq.Header.Set("Authorization", "Bearer "+apiKey)
+				upstreamReq.Header.Set("x-api-key", apiKey)
+				account.ApplyHeaderOverrides(upstreamReq.Header)
+			}
 			return upstreamReq, "x-request-id", nil
 		}
 		requestIDHeader = "x-request-id"
@@ -1787,14 +1798,52 @@ func sleepGeminiBackoff(attempt int) {
 
 var (
 	sensitiveQueryParamRegex = regexp.MustCompile(`(?i)([?&](?:key|client_secret|access_token|refresh_token)=)[^&"\s]+`)
+	upstreamURLRegex         = regexp.MustCompile(`(?i)\bhttps?://[^\s"'<>]+`)
+	upstreamHostPortRegex    = regexp.MustCompile(`(?i)\b(?:(?:\d{1,3}\.){3}\d{1,3}|[a-z0-9-]+\.[a-z0-9.-]+|localhost):\d{1,5}\b`)
 	retryInRegex             = regexp.MustCompile(`Please retry in ([0-9.]+)s`)
 )
+
+var officialUpstreamHostSuffixes = []string{
+	"openai.com",
+	"chatgpt.com",
+	"anthropic.com",
+	"x.ai",
+	"googleapis.com",
+	"google.com",
+	"groq.com",
+	"deepseek.com",
+	"mistral.ai",
+	"cohere.com",
+	"moonshot.ai",
+}
+
+func isOfficialUpstreamHost(hostname string) bool {
+	hostname = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(hostname), "."))
+	for _, suffix := range officialUpstreamHostSuffixes {
+		if hostname == suffix || strings.HasSuffix(hostname, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
+func sanitizeUpstreamURLHosts(msg string) string {
+	msg = upstreamURLRegex.ReplaceAllStringFunc(msg, func(raw string) string {
+		u, err := url.Parse(raw)
+		if err != nil || u.Hostname() == "" || isOfficialUpstreamHost(u.Hostname()) {
+			return raw
+		}
+		return "<upstream-url>" + u.RequestURI()
+	})
+	return upstreamHostPortRegex.ReplaceAllString(msg, "<upstream-host>")
+}
 
 func sanitizeUpstreamErrorMessage(msg string) string {
 	if msg == "" {
 		return msg
 	}
-	return sensitiveQueryParamRegex.ReplaceAllString(msg, `$1***`)
+	msg = sensitiveQueryParamRegex.ReplaceAllString(msg, `$1***`)
+	return sanitizeUpstreamURLHosts(msg)
 }
 
 func (s *GeminiMessagesCompatService) writeGeminiMappedError(c *gin.Context, account *Account, upstreamStatus int, upstreamRequestID string, body []byte) error {

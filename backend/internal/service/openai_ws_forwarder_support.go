@@ -42,6 +42,14 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	if !s.isOpenAIWSGeneratePrewarmEnabled() {
 		return nil
 	}
+	// A confirmed 429 already has an explicit client/session continuation
+	// path. Do not issue a hidden generate=false probe on that account: the
+	// probe has no client-visible response binding and therefore cannot safely
+	// become a new guarded socket.
+	if s.isOpenAIWS429GuardConnectionActive(account) {
+		logOpenAIWSModeInfo("prewarm_skip account_id=%d conn_id=%s reason=429_guard_active", account.ID, connID)
+		return nil
+	}
 	if decision.Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
 		logOpenAIWSModeInfo(
 			"prewarm_skip account_id=%d conn_id=%s reason=transport_not_v2 transport=%s",
@@ -76,6 +84,9 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 		prewarmPayload[k] = v
 	}
 	prewarmPayload["generate"] = false
+	// Prewarm is a real response.create write. Refresh its transport timestamp
+	// independently so the later business request receives its own stamp.
+	normalizeOpenAIWSResponseCreatePayload(prewarmPayload, openAIWSResponseCreateProtocolOptions{})
 	prewarmPayloadJSON := payloadAsJSONBytes(prewarmPayload)
 
 	if err := lease.WriteJSONWithContextTimeout(ctx, prewarmPayload, s.openAIWSWriteTimeout()); err != nil {
@@ -93,6 +104,62 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 	prewarmResponseID := ""
 	prewarmEventCount := 0
 	prewarmTerminalCount := 0
+	rateLimitSignalHandled := false
+	recordPrewarmRateLimit := func(upstreamStatus int, codeRaw, errTypeRaw, errMsgRaw string, responseBody []byte) bool {
+		isRateLimit := isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw)
+		explicit429 := isOpenAIWSExplicit429Signal(upstreamStatus, codeRaw, errTypeRaw, errMsgRaw, responseBody)
+		if !isRateLimit || rateLimitSignalHandled {
+			return isRateLimit
+		}
+		if upstreamStatus == http.StatusTooManyRequests && !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, errMsgRaw) {
+			s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, lease.HandshakeHeaders(), responseBody)
+		} else {
+			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), responseBody, codeRaw, errTypeRaw, errMsgRaw, upstreamStatus)
+		}
+		rateLimitSignalHandled = true
+		// A prewarm 429 can be the second explicit signal that confirms the
+		// already-acquired socket. A lease observed during the transition is
+		// eligible only when the exact socket was already pooled before it;
+		// fresh post-block sockets remain failover-only.
+		if explicit429 && (!lease.openAI429GuardActiveAtAcquire || s.isOpenAIWS429GuardConnectionCandidate(account, lease.ConnID(), lease.openAIRuntimeBlockGeneration)) {
+			s.markOpenAI429GuardConnectionProof(account, lease)
+			if s.isOpenAIWS429GuardConnectionPinned(account, lease.ConnID()) {
+				lease.openAI429GuardProven.Store(true)
+			}
+		}
+		return true
+	}
+	prewarmFailover := func(status int, message []byte, errMsg string) error {
+		if status <= 0 {
+			status = http.StatusBadGateway
+		}
+		// A confirmed 429 is semantic account state. Once this exact prewarm
+		// lease has been positively pinned, retain it for the next continuation;
+		// all first-signal and transport failures still evict normally.
+		if status != http.StatusTooManyRequests || !s.isOpenAIWS429GuardConnectionPinned(account, lease.ConnID()) {
+			lease.MarkBroken()
+		}
+		failoverErr := newOpenAIUpstreamFailoverError(
+			status,
+			lease.HandshakeHeaders(),
+			append([]byte(nil), message...),
+			errMsg,
+			false,
+		)
+		if status == http.StatusTooManyRequests && s.isOpenAIWS429GuardConnectionPinned(account, lease.ConnID()) {
+			return wrapOpenAIWSFallbackKeepConnection("prewarm_upstream_rate_limited", failoverErr)
+		}
+		return failoverErr
+	}
+	prewarmUpstreamFailureStatus := func(message []byte) int {
+		// A prewarm response is never client-visible, so every explicit 5xx
+		// means the socket cannot satisfy the next turn. Preserve the exact
+		// status when present; fall back to the semantic server-error mapper.
+		if status := openAIWSPayloadUpstreamStatus(message); status >= http.StatusInternalServerError && status <= 599 {
+			return status
+		}
+		return openAIWSPayloadTransientStatus(message)
+	}
 	for {
 		message, readErr := lease.ReadMessageWithContextTimeout(ctx, s.openAIWSReadTimeout())
 		if readErr != nil {
@@ -131,12 +198,17 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 
 		if eventType == "error" {
 			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(message)
-			s.persistOpenAIWSRateLimitSignal(ctx, account, lease.HandshakeHeaders(), message, errCodeRaw, errTypeRaw, errMsgRaw)
+			upstreamStatus := openAIWSPayloadUpstreamStatus(message)
+			isRateLimit := recordPrewarmRateLimit(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, message)
 			errMsg := strings.TrimSpace(errMsgRaw)
 			if errMsg == "" {
 				errMsg = "OpenAI websocket prewarm error"
 			}
 			fallbackReason, canFallback := classifyOpenAIWSErrorEventFromRaw(errCodeRaw, errTypeRaw, errMsgRaw)
+			if isRateLimit {
+				fallbackReason = "upstream_rate_limited"
+				canFallback = true
+			}
 			errCode, errType, errMessage := summarizeOpenAIWSErrorEventFieldsFromRaw(errCodeRaw, errTypeRaw, errMsgRaw)
 			logOpenAIWSModeInfo(
 				"prewarm_error_event account_id=%d conn_id=%s idx=%d fallback_reason=%s can_fallback=%v err_code=%s err_type=%s err_message=%s",
@@ -149,11 +221,37 @@ func (s *OpenAIGatewayService) performOpenAIWSGeneratePrewarm(
 				errType,
 				errMessage,
 			)
+			if isRateLimit {
+				return prewarmFailover(http.StatusTooManyRequests, message, errMsg)
+			}
+			if transientStatus := prewarmUpstreamFailureStatus(message); transientStatus >= http.StatusInternalServerError {
+				s.handleOpenAIAccountUpstreamError(ctx, account, transientStatus, lease.HandshakeHeaders(), message)
+				return prewarmFailover(transientStatus, message, errMsg)
+			}
 			lease.MarkBroken()
 			if canFallback {
 				return wrapOpenAIWSFallback("prewarm_"+fallbackReason, errors.New(errMsg))
 			}
 			return wrapOpenAIWSFallback("prewarm_error_event", errors.New(errMsg))
+		}
+
+		if eventType == "response.failed" {
+			errCodeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(message)
+			upstreamStatus := openAIWSPayloadUpstreamStatus(message)
+			isRateLimit := recordPrewarmRateLimit(upstreamStatus, errCodeRaw, errTypeRaw, errMsgRaw, message)
+			errMsg := strings.TrimSpace(errMsgRaw)
+			if errMsg == "" {
+				errMsg = "OpenAI websocket prewarm response failed"
+			}
+			if isRateLimit {
+				return prewarmFailover(http.StatusTooManyRequests, message, errMsg)
+			}
+			if transientStatus := prewarmUpstreamFailureStatus(message); transientStatus >= http.StatusInternalServerError {
+				s.handleOpenAIAccountUpstreamError(ctx, account, transientStatus, lease.HandshakeHeaders(), message)
+				return prewarmFailover(transientStatus, message, errMsg)
+			}
+			lease.MarkBroken()
+			return wrapOpenAIWSFallback("prewarm_response_failed", errors.New(errMsg))
 		}
 
 		if isOpenAIWSTerminalEvent(eventType) {
@@ -195,6 +293,39 @@ func payloadAsJSONBytes(payload map[string]any) []byte {
 	return body
 }
 
+// openAIWSEmptyErrorClientMessage is injected into upstream `error` events that
+// carry no code/type/message before they are forwarded to a client. The phrase
+// "You can retry your request" mirrors OpenAI's own transient-failure wording so
+// downstream retry classifiers treat the failure as retryable.
+const openAIWSEmptyErrorClientMessage = "Upstream provider returned an error without details. You can retry your request."
+
+// ensureOpenAIWSErrorEventClientDetail rewrites an upstream `error` event whose
+// error object has no code/type/message before forwarding it to a client.
+// Strict SDK clients (e.g. openai-node) stringify the empty error object into
+// the literal message "{}", which no downstream retry classifier can recognize,
+// so a transient upstream failure terminates the client session instead of
+// being retried. Like sanitizeOpenAICapacityShedErrorCodeForClient, this only
+// changes the client-facing copy: monitoring, account-state and failover
+// decisions all run on the original payload.
+func ensureOpenAIWSErrorEventClientDetail(message []byte) ([]byte, bool) {
+	code, errType, errMsg := parseOpenAIWSErrorEventFields(message)
+	if code != "" || errType != "" || errMsg != "" {
+		return message, false
+	}
+	if !gjson.ValidBytes(message) {
+		return message, false
+	}
+	updated, err := sjson.SetBytes(message, "error", map[string]any{
+		"code":    openAICapacityShedRetryableClientCode,
+		"type":    "server_error",
+		"message": openAIWSEmptyErrorClientMessage,
+	})
+	if err != nil {
+		return message, false
+	}
+	return updated, true
+}
+
 func isOpenAIWSTerminalEvent(eventType string) bool {
 	switch strings.TrimSpace(eventType) {
 	case "response.completed", "response.done", "response.failed", "response.incomplete", "response.cancelled", "response.canceled":
@@ -221,7 +352,7 @@ func normalizeOpenAIWSTerminalEvent(eventType string) string {
 	}
 }
 
-func openAIWSPayloadTransientStatus(payload []byte) int {
+func openAIWSPayloadUpstreamStatus(payload []byte) int {
 	if len(payload) == 0 {
 		return 0
 	}
@@ -235,6 +366,17 @@ func openAIWSPayloadTransientStatus(payload []byte) int {
 	if status == 0 {
 		status = int(gjson.GetBytes(payload, "error.status").Int())
 	}
+	if status == 0 {
+		status = int(gjson.GetBytes(payload, "status_code").Int())
+	}
+	if status == 0 {
+		status = int(gjson.GetBytes(payload, "status").Int())
+	}
+	return status
+}
+
+func openAIWSPayloadTransientStatus(payload []byte) int {
+	status := openAIWSPayloadUpstreamStatus(payload)
 	if shouldCooldownOpenAITransientUpstreamError(status, payload) {
 		return status
 	}
@@ -318,6 +460,27 @@ func isOpenAIWSTokenEvent(eventType string) bool {
 	// 不能把它们当作 token event，否则当上游没有可识别的 delta 时，
 	// firstTokenMs 会被填到终止时刻，等于把"总耗时"误报为"首 token 延迟"。
 	return false
+}
+
+// openAIWSEventHasSemanticOutput excludes lifecycle/control frames from the
+// replay guard. A created/in-progress frame may already be visible to the
+// client, but it does not contain assistant or tool output that would be
+// duplicated by a safe upstream retry.
+func openAIWSEventHasSemanticOutput(eventType string, payload []byte) bool {
+	eventType = strings.TrimSpace(eventType)
+	if isOpenAIWSTokenEvent(eventType) {
+		return true
+	}
+	switch eventType {
+	case "response.output_item.added", "response.output_item.done":
+		item := gjson.GetBytes(payload, "item")
+		return item.Exists() && item.Type == gjson.JSON && strings.TrimSpace(item.Get("type").String()) != ""
+	case "response.completed", "response.done":
+		output := gjson.GetBytes(payload, "response.output")
+		return output.IsArray() && len(output.Array()) > 0
+	default:
+		return false
+	}
 }
 
 func replaceOpenAIWSMessageModel(message []byte, fromModel, toModel string) []byte {
@@ -505,6 +668,15 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	if !account.SupportsOpenAIEndpointCapability(requiredCapability) {
 		return 0, nil, "", nil
 	}
+	// Runtime blocks must apply to every previous_response_id path, including
+	// deployments without a scheduler snapshot. The 429 guard continuation is
+	// resolved before this helper and is the sole exception: it requires the
+	// exact permanently pinned socket. Letting ordinary response affinity skip
+	// this check would revive accounts blocked for auth, transport, or admin
+	// reasons and could also bypass a stale 429 guard binding.
+	if s.isOpenAIAccountRequestRuntimeBlocked(account, requestedModel) {
+		return 0, nil, "", nil
+	}
 	// Quota auto-pause must also gate the previous_response_id sticky path; otherwise an
 	// account over its 5h/7d threshold keeps serving the same response chain even though
 	// normal scheduling skips it. Pause is transient, so fall through to normal scheduling
@@ -558,12 +730,127 @@ func (s *OpenAIGatewayService) resolveAccountByPreviousResponseIDForCapability(
 	return accountID, account, responseID, store
 }
 
+// clearOpenAIWSContinuationBindings removes only the bindings still owned by
+// the failed account/connection. A resumed turn must not leave a stale
+// response or session affinity that can route the next client reconnect back
+// to the broken connection, while a concurrent replacement binding is kept.
+func (s *OpenAIGatewayService) clearOpenAIWSContinuationBindings(
+	ctx context.Context,
+	groupID int64,
+	sessionHash string,
+	accountID int64,
+	previousResponseID string,
+	connID string,
+) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	store := s.getOpenAIWSStateStore()
+	if store != nil {
+		conditionalCleaner, hasConditionalCleaner := store.(openAIWSContinuationBindingCleaner)
+		responseID := strings.TrimSpace(previousResponseID)
+		if responseID != "" {
+			if hasConditionalCleaner {
+				conditionalCleaner.deleteResponseBindingIfMatches(ctx, groupID, responseID, accountID, connID)
+			} else {
+				boundAccountID, err := store.GetResponseAccount(ctx, groupID, responseID)
+				boundConnID, connExists := store.GetResponseConn(responseID)
+				connMatches := !connExists || strings.TrimSpace(connID) == "" || boundConnID == strings.TrimSpace(connID)
+				if err == nil && boundAccountID == accountID && connMatches {
+					_ = store.DeleteResponseAccount(ctx, groupID, responseID)
+					if !connExists || strings.TrimSpace(connID) == "" || boundConnID == strings.TrimSpace(connID) {
+						store.DeleteResponseConn(responseID)
+					}
+				}
+			}
+		}
+
+		hash := strings.TrimSpace(sessionHash)
+		if hash != "" {
+			matchedSessionConn := false
+			if hasConditionalCleaner {
+				matchedSessionConn = conditionalCleaner.deleteSessionConnIfMatches(groupID, hash, connID)
+			} else {
+				boundConnID, exists := store.GetSessionConn(groupID, hash)
+				matchedSessionConn = !exists || strings.TrimSpace(connID) == "" || boundConnID == strings.TrimSpace(connID)
+				if matchedSessionConn {
+					store.DeleteSessionConn(groupID, hash)
+				}
+			}
+			if matchedSessionConn {
+				store.DeleteSessionTurnState(groupID, hash)
+				if stickyAccountID, err := s.getStickySessionAccountID(ctx, &groupID, hash); err == nil && stickyAccountID == accountID {
+					_ = s.deleteStickySessionAccountID(ctx, &groupID, hash)
+				}
+			}
+		}
+	}
+}
+
+func (s *OpenAIGatewayService) pinOpenAI429GuardConnection(account *Account, connID string) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() {
+		return false
+	}
+	if !s.isOpenAI429GuardPooledWSMode(account) {
+		return false
+	}
+	if !s.isOpenAIWS429GuardConnectionActive(account) {
+		return false
+	}
+	pool := s.getOpenAIWSConnPool()
+	if pool == nil {
+		return false
+	}
+	// Keep the runtime lock through the generation check and pool mutation. A
+	// concurrent clear or non-429 transition must not let an old snapshot
+	// re-install a permanent guard pin after the account has changed state.
+	mu := s.openAIAccountRuntimeBlockLock(account.ID)
+	mu.Lock()
+	defer mu.Unlock()
+	snapshot := s.openAIAccountRuntimeBlockSnapshotLocked(account.ID)
+	if !snapshot.Active || snapshot.Reason != "429" || snapshot.Generation == 0 {
+		return false
+	}
+	// Do not tie the old socket to the account cooldown or either ordinary
+	// sticky TTL. The guard's contract is: retain it until a real connection
+	// failure, explicit account invalidation, or process shutdown.
+	return pool.PinGuardConnForGeneration(account.ID, connID, snapshot.Generation)
+}
+
+func (s *OpenAIGatewayService) bindOpenAIWSGuardContinuation(
+	stateStore OpenAIWSStateStore,
+	groupID int64,
+	account *Account,
+	responseID string,
+	connID string,
+	sessionHash string,
+	storeDisabled bool,
+) {
+	if s == nil || stateStore == nil || account == nil ||
+		!s.isOpenAIWS429GuardConnectionPinned(account, connID) {
+		return
+	}
+	guardStore, ok := stateStore.(openAIWSGuardBindingStore)
+	if !ok {
+		return
+	}
+	if strings.TrimSpace(responseID) != "" {
+		guardStore.BindGuardResponse(groupID, responseID, account.ID, connID)
+	}
+	if storeDisabled && strings.TrimSpace(sessionHash) != "" {
+		guardStore.BindGuardSession(groupID, sessionHash, account.ID, connID)
+	}
+}
+
 func classifyOpenAIWSAcquireError(err error) string {
 	if err == nil {
 		return "acquire_conn"
 	}
 	var dialErr *openAIWSDialError
 	if errors.As(err, &dialErr) {
+		if _, rateLimited := openAIWSDialRateLimitStatus(err); rateLimited {
+			return "upstream_rate_limited"
+		}
 		switch dialErr.StatusCode {
 		case 426:
 			return "upgrade_required"
@@ -606,14 +893,128 @@ func isOpenAIWSRateLimitError(codeRaw, errTypeRaw, msgRaw string) bool {
 	if strings.Contains(msg, "rate limit") && (strings.Contains(msg, "reached") || strings.Contains(msg, "exceeded")) {
 		return true
 	}
+	// Reverse proxies occasionally collapse the upstream error into a plain
+	// transport message, for example "exceeded retry limit, last status: 429
+	// Too Many Requests". Match only explicit status/message combinations so a
+	// bare number in arbitrary text never becomes an account-level 429 signal.
+	if strings.Contains(msg, "too many requests") ||
+		strings.Contains(msg, "last status: 429") ||
+		strings.Contains(msg, "last status=429") ||
+		strings.Contains(msg, "http status 429") ||
+		strings.Contains(msg, "http 429") {
+		return true
+	}
 	return false
 }
 
-func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignal(ctx context.Context, account *Account, headers http.Header, responseBody []byte, codeRaw, errTypeRaw, msgRaw string) {
-	if s == nil || s.rateLimitService == nil || account == nil || account.Platform != PlatformOpenAI {
+// isOpenAIWSExplicit429Signal reports evidence that the upstream actually
+// returned HTTP 429. Semantic codes such as usage_limit_reached or
+// insufficient_quota are useful for request failover, but by themselves they
+// must not advance the account-level two-confirmation 429 guard.
+func isOpenAIWSExplicit429Signal(upstreamStatus int, codeRaw, errTypeRaw, msgRaw string, responseBody []byte) bool {
+	if upstreamStatus != 0 {
+		return upstreamStatus == http.StatusTooManyRequests
+	}
+	if bodyStatus := openAIWSPayloadUpstreamStatus(responseBody); bodyStatus != 0 {
+		return bodyStatus == http.StatusTooManyRequests
+	}
+	for _, raw := range []string{codeRaw, errTypeRaw, msgRaw} {
+		value := strings.ToLower(strings.TrimSpace(raw))
+		switch value {
+		case "429", "http 429", "http status 429", "status 429", "status: 429":
+			return true
+		}
+		if strings.Contains(value, "too many requests") ||
+			strings.Contains(value, "last status: 429") ||
+			strings.Contains(value, "last status=429") ||
+			strings.Contains(value, "http status 429") ||
+			strings.Contains(value, "http 429") {
+			return true
+		}
+	}
+	return false
+}
+
+// isOpenAIWSRateLimitSignal classifies an upstream rate-limit signal without
+// letting a contradictory explicit status be overridden by a stale error code.
+// Some upstream relays preserve an old rate_limit_* code while reporting a
+// current 5xx; only a status-less frame may fall back to its textual fields.
+func isOpenAIWSRateLimitSignal(upstreamStatus int, codeRaw, errTypeRaw, msgRaw string) bool {
+	if upstreamStatus != 0 {
+		return upstreamStatus == http.StatusTooManyRequests
+	}
+	return isOpenAIWSRateLimitError(codeRaw, errTypeRaw, msgRaw)
+}
+
+// openAIWSDialRateLimitStatus extracts an explicit 429 from a failed
+// WebSocket handshake. A few reverse proxies lose the HTTP status while
+// retaining the status in the response body or transport error text. An
+// explicit non-zero status always wins so a stale rate-limit code cannot turn a
+// 5xx handshake into an account-level 429 signal.
+func openAIWSDialRateLimitStatus(err error) (int, bool) {
+	if err == nil {
+		return 0, false
+	}
+	var dialErr *openAIWSDialError
+	if !errors.As(err, &dialErr) || dialErr == nil {
+		return 0, false
+	}
+	if dialErr.StatusCode != 0 {
+		return dialErr.StatusCode, dialErr.StatusCode == http.StatusTooManyRequests
+	}
+
+	if bodyStatus := openAIWSPayloadUpstreamStatus(dialErr.ResponseBody); bodyStatus != 0 {
+		return bodyStatus, bodyStatus == http.StatusTooManyRequests
+	}
+	codeRaw, errTypeRaw, errMsgRaw := parseOpenAIWSErrorEventFields(dialErr.ResponseBody)
+	if errMsgRaw == "" && len(dialErr.ResponseBody) > 0 {
+		errMsgRaw = strings.TrimSpace(extractUpstreamErrorMessage(dialErr.ResponseBody))
+	}
+	if dialErr.Err != nil {
+		transportMessage := strings.TrimSpace(dialErr.Err.Error())
+		if errMsgRaw == "" {
+			errMsgRaw = transportMessage
+		} else if transportMessage != "" {
+			errMsgRaw += " " + transportMessage
+		}
+	}
+	if isOpenAIWSExplicit429Signal(0, codeRaw, errTypeRaw, errMsgRaw, dialErr.ResponseBody) {
+		return http.StatusTooManyRequests, true
+	}
+	return 0, false
+}
+
+// openAIWS429GuardErrorEventFailureStatus classifies an `error` event emitted
+// by the exact socket retained for a confirmed OAuth 429. Rate-limit frames
+// are the one expected semantic outcome: every other error frame means the
+// old upstream connection is no longer trustworthy and must be migrated
+// before anything reaches the client.
+func openAIWS429GuardErrorEventFailureStatus(upstreamStatus int, codeRaw, errTypeRaw, msgRaw string) (int, bool) {
+	if isOpenAIWSRateLimitSignal(upstreamStatus, codeRaw, errTypeRaw, msgRaw) {
+		return 0, false
+	}
+	status := upstreamStatus
+	if status == 0 {
+		status = openAIWSErrorHTTPStatusFromRawWithMessage(codeRaw, errTypeRaw, msgRaw)
+	}
+	// An `error` envelope with a malformed/success status is still an upstream
+	// connection failure. Preserve a retryable gateway classification instead
+	// of returning a misleading success status to the failover coordinator.
+	if status < http.StatusBadRequest {
+		status = http.StatusBadGateway
+	}
+	return status, true
+}
+
+func (s *OpenAIGatewayService) persistOpenAIWSRateLimitSignal(ctx context.Context, account *Account, headers http.Header, responseBody []byte, codeRaw, errTypeRaw, msgRaw string, upstreamStatus ...int) {
+	if s == nil || account == nil || account.Platform != PlatformOpenAI {
 		return
 	}
-	if !isOpenAIWSRateLimitError(codeRaw, errTypeRaw, msgRaw) {
+	status := 0
+	if len(upstreamStatus) > 0 {
+		status = upstreamStatus[0]
+	}
+	if !isOpenAIWSExplicit429Signal(status, codeRaw, errTypeRaw, msgRaw, responseBody) {
 		return
 	}
 	s.handleOpenAIAccountUpstreamError(ctx, account, http.StatusTooManyRequests, headers, responseBody)
@@ -673,6 +1074,10 @@ func classifyOpenAIWSErrorEvent(message []byte) (string, bool) {
 }
 
 func openAIWSErrorHTTPStatusFromRaw(codeRaw, errTypeRaw string) int {
+	return openAIWSErrorHTTPStatusFromRawWithMessage(codeRaw, errTypeRaw, "")
+}
+
+func openAIWSErrorHTTPStatusFromRawWithMessage(codeRaw, errTypeRaw, msgRaw string) int {
 	code := strings.ToLower(strings.TrimSpace(codeRaw))
 	errType := strings.ToLower(strings.TrimSpace(errTypeRaw))
 	switch {
@@ -689,7 +1094,7 @@ func openAIWSErrorHTTPStatusFromRaw(codeRaw, errTypeRaw string) int {
 	case strings.Contains(errType, "permission"),
 		strings.Contains(code, "forbidden"):
 		return http.StatusForbidden
-	case isOpenAIWSRateLimitError(codeRaw, errTypeRaw, ""):
+	case isOpenAIWSRateLimitError(codeRaw, errTypeRaw, msgRaw):
 		return http.StatusTooManyRequests
 	default:
 		return http.StatusBadGateway
@@ -700,8 +1105,8 @@ func openAIWSErrorHTTPStatus(message []byte) int {
 	if len(message) == 0 {
 		return http.StatusBadGateway
 	}
-	codeRaw, errTypeRaw, _ := parseOpenAIWSErrorEventFields(message)
-	return openAIWSErrorHTTPStatusFromRaw(codeRaw, errTypeRaw)
+	codeRaw, errTypeRaw, msgRaw := parseOpenAIWSErrorEventFields(message)
+	return openAIWSErrorHTTPStatusFromRawWithMessage(codeRaw, errTypeRaw, msgRaw)
 }
 
 func (s *OpenAIGatewayService) openAIWSFallbackCooldown() time.Duration {

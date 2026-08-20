@@ -75,6 +75,8 @@ func TestSchedulerCacheUpdateLastUsedClearsUnencodablePayload(t *testing.T) {
 	cache := newSchedulerCacheUnit(t)
 	account := service.Account{ID: 114, Platform: service.PlatformOpenAI, Type: service.AccountTypeAPIKey}
 	require.NoError(t, cache.SetAccount(ctx, &account))
+	legacyKey := schedulerLegacyAccountMetaKey(strconv.FormatInt(account.ID, 10))
+	require.NoError(t, cache.rdb.Set(ctx, legacyKey, `{}`, 0).Err())
 
 	invalidTime := time.Date(10000, time.January, 1, 0, 0, 0, 0, time.UTC)
 	require.NoError(t, cache.UpdateLastUsed(ctx, map[int64]time.Time{account.ID: invalidTime}))
@@ -82,6 +84,7 @@ func TestSchedulerCacheUpdateLastUsedClearsUnencodablePayload(t *testing.T) {
 	cached, err := cache.GetAccount(ctx, account.ID)
 	require.NoError(t, err)
 	require.Nil(t, cached)
+	require.EqualValues(t, 0, cache.rdb.Exists(ctx, legacyKey).Val())
 }
 
 func TestSchedulerCacheSnapshotAccountIDReusePreservesPayloadAndMembers(t *testing.T) {
@@ -329,6 +332,29 @@ func TestBuildSchedulerMetadataAccount_KeepsOpenAIWSFlags(t *testing.T) {
 	require.Nil(t, got.Extra["unused_large_field"])
 }
 
+func TestBuildSchedulerMetadataAccount_KeepsCodexFingerprintLifecycle(t *testing.T) {
+	account := service.Account{
+		ID:       49,
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
+		Extra: map[string]any{
+			"codex_fingerprint_mode": "full",
+			"codex_fingerprint_seed": "11111111-1111-4111-8111-111111111111",
+			"openai_device_id":       "legacy-device",
+			"openai_session_id":      "legacy-session",
+			"unused_large_field":     "drop-me",
+		},
+	}
+
+	got := buildSchedulerMetadataAccount(account)
+
+	require.Equal(t, "full", got.Extra["codex_fingerprint_mode"])
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", got.Extra["codex_fingerprint_seed"])
+	require.NotContains(t, got.Extra, "openai_device_id")
+	require.NotContains(t, got.Extra, "openai_session_id")
+	require.NotContains(t, got.Extra, "unused_large_field")
+}
+
 func TestBuildSchedulerMetadataAccount_KeepsGrokMediaEligibility(t *testing.T) {
 	t.Run("explicit override", func(t *testing.T) {
 		account := service.Account{
@@ -373,6 +399,130 @@ func TestBuildSchedulerMetadataAccount_KeepsGrokMediaEligibility(t *testing.T) {
 	})
 }
 
+func TestBuildSchedulerMetadataAccount_KeepsPreHydrationSchedulingFields(t *testing.T) {
+	now := time.Now().UTC().Truncate(time.Second)
+
+	t.Run("anthropic threshold override and windows", func(t *testing.T) {
+		windowEnd := now.Add(2 * time.Hour)
+		account := service.Account{
+			ID:               90,
+			Platform:         service.PlatformAnthropic,
+			Type:             service.AccountTypeOAuth,
+			Status:           service.StatusActive,
+			Schedulable:      true,
+			SessionWindowEnd: &windowEnd,
+			Credentials: map[string]any{
+				"account_scheduling_threshold": 80,
+				"access_token":                 "must-not-enter-metadata",
+			},
+			Extra: map[string]any{
+				"session_window_utilization":   0.85,
+				"passive_usage_7d_utilization": 0.90,
+				"passive_usage_7d_reset":       now.Add(7 * 24 * time.Hour).Format(time.RFC3339),
+				"unrelated":                    "drop-me",
+			},
+		}
+
+		got := buildSchedulerMetadataAccount(account)
+		decision := service.EvaluateAccountSchedulingThreshold(&got, map[string]int{
+			service.PlatformAnthropic: 95,
+		}, now)
+
+		require.True(t, decision.ShouldPause)
+		require.Equal(t, 80, decision.ThresholdPercent)
+		require.Equal(t, "7d", decision.Window)
+		require.Empty(t, got.GetCredential("access_token"))
+		require.NotContains(t, got.Extra, "unrelated")
+	})
+
+	t.Run("grok threshold and scheduling identity", func(t *testing.T) {
+		account := service.Account{
+			ID:          91,
+			Platform:    service.PlatformGrok,
+			Type:        service.AccountTypeOAuth,
+			Status:      service.StatusActive,
+			Schedulable: true,
+			Credentials: map[string]any{
+				"account_scheduling_threshold": 80,
+				"subscription_tier":            "free",
+				"team_id":                      "team-a",
+				"refresh_token":                "must-not-enter-metadata",
+			},
+			Extra: map[string]any{
+				"grok_sched_utilization": 90.0,
+				"grok_sched_reset_at":    now.Add(time.Hour).Format(time.RFC3339),
+			},
+		}
+
+		got := buildSchedulerMetadataAccount(account)
+		decision := service.EvaluateAccountSchedulingThreshold(&got, map[string]int{
+			service.PlatformGrok: 95,
+		}, now)
+
+		require.True(t, decision.ShouldPause)
+		require.Equal(t, 80, decision.ThresholdPercent)
+		require.Equal(t, "quota", decision.Window)
+		require.Equal(t, "free", got.GetCredential("subscription_tier"))
+		require.Equal(t, "team-a", got.GetCredential("team_id"))
+		require.Empty(t, got.GetCredential("refresh_token"))
+	})
+
+	t.Run("openai privacy passthrough and compact routing", func(t *testing.T) {
+		account := service.Account{
+			ID:       92,
+			Platform: service.PlatformOpenAI,
+			Type:     service.AccountTypeOAuth,
+			Credentials: map[string]any{
+				"model_mapping": map[string]any{"known-model": "known-model"},
+			},
+			Extra: map[string]any{
+				"privacy_mode":             service.PrivacyModeTrainingOff,
+				"openai_passthrough":       true,
+				"openai_compact_mode":      service.OpenAICompactModeForceOn,
+				"openai_compact_supported": true,
+			},
+		}
+
+		got := buildSchedulerMetadataAccount(account)
+		supported, known := got.OpenAICompactSupportKnown()
+
+		require.True(t, got.IsPrivacySet())
+		require.True(t, got.IsOpenAIPassthroughEnabled())
+		require.True(t, got.IsModelSupported("unmapped-upstream-model"))
+		require.True(t, known)
+		require.True(t, supported)
+	})
+}
+
+func TestSchedulerMetadataSchemaVersionRejectsAndCleansLegacyPayload(t *testing.T) {
+	ctx := context.Background()
+	cache := newSchedulerCacheUnit(t)
+	account := service.Account{ID: 93, Platform: service.PlatformGrok, Type: service.AccountTypeOAuth}
+	bucket := service.SchedulerBucket{GroupID: 93, Platform: service.PlatformGrok, Mode: service.SchedulerModeSingle}
+	token, err := cache.CaptureBucketWriteToken(ctx, bucket)
+	require.NoError(t, err)
+	require.NoError(t, cache.SetSnapshot(ctx, bucket, token, []service.Account{account}))
+
+	id := strconv.FormatInt(account.ID, 10)
+	metadata, err := cache.rdb.Get(ctx, schedulerAccountMetaKey(id)).Bytes()
+	require.NoError(t, err)
+	require.NoError(t, cache.rdb.Del(ctx, schedulerAccountMetaKey(id)).Err())
+	require.NoError(t, cache.rdb.Set(ctx, schedulerLegacyAccountMetaKey(id), metadata, 0).Err())
+
+	snapshot, hit, err := cache.GetSnapshot(ctx, bucket)
+	require.NoError(t, err)
+	require.False(t, hit, "legacy metadata must force a database rebuild")
+	require.Nil(t, snapshot)
+
+	require.NoError(t, cache.SetAccount(ctx, &account))
+	require.EqualValues(t, 0, cache.rdb.Exists(ctx, schedulerLegacyAccountMetaKey(id)).Val())
+	require.EqualValues(t, 1, cache.rdb.Exists(ctx, schedulerAccountMetaKey(id)).Val())
+
+	require.NoError(t, cache.rdb.Set(ctx, schedulerLegacyAccountMetaKey(id), metadata, 0).Err())
+	require.NoError(t, cache.DeleteAccount(ctx, account.ID))
+	require.EqualValues(t, 0, cache.rdb.Exists(ctx, schedulerLegacyAccountMetaKey(id)).Val())
+}
+
 func TestBuildSchedulerMetadataAccount_KeepsSlimGroupMembership(t *testing.T) {
 	account := service.Account{
 		ID:       42,
@@ -415,7 +565,9 @@ func TestBuildSchedulerMetadataAccount_KeepsSlimGroupMembership(t *testing.T) {
 
 func TestBuildSchedulerMetadataAccount_KeepsQuotaAutoPauseFields(t *testing.T) {
 	account := service.Account{
-		ID: 88,
+		ID:       88,
+		Platform: service.PlatformOpenAI,
+		Type:     service.AccountTypeOAuth,
 		Extra: map[string]any{
 			"codex_5h_used_percent":        12.34,
 			"codex_7d_used_percent":        56.78,
@@ -424,10 +576,20 @@ func TestBuildSchedulerMetadataAccount_KeepsQuotaAutoPauseFields(t *testing.T) {
 			"codex_5h_reset_after_seconds": 300,
 			"codex_7d_reset_after_seconds": 600,
 			"codex_usage_updated_at":       "2026-05-29T09:00:00Z",
-			"auto_pause_5h_threshold":      0.95,
-			"auto_pause_7d_threshold":      0.96,
-			"auto_pause_5h_disabled":       true,
-			"auto_pause_7d_disabled":       false,
+			"codex_credit_snapshot": map[string]any{
+				"has_credits": true,
+				"balance":     "1000.0000000000",
+				"updated_at":  "2026-05-29T09:00:00Z",
+			},
+			"auto_pause_5h_threshold": 0.95,
+			"auto_pause_7d_threshold": 0.96,
+			"auto_pause_5h_disabled":  true,
+			"auto_pause_7d_disabled":  false,
+			service.AccountHealthProbeExtraKey: map[string]any{
+				"status":   service.AccountHealthProbeStatusFailed,
+				"mode":     service.AccountHealthProbeModeOAuth,
+				"attempts": 2,
+			},
 		},
 	}
 
@@ -440,10 +602,13 @@ func TestBuildSchedulerMetadataAccount_KeepsQuotaAutoPauseFields(t *testing.T) {
 	require.Equal(t, 300, got.Extra["codex_5h_reset_after_seconds"])
 	require.Equal(t, 600, got.Extra["codex_7d_reset_after_seconds"])
 	require.Equal(t, "2026-05-29T09:00:00Z", got.Extra["codex_usage_updated_at"])
+	require.Equal(t, account.Extra["codex_credit_snapshot"], got.Extra["codex_credit_snapshot"])
 	require.Equal(t, 0.95, got.Extra["auto_pause_5h_threshold"])
 	require.Equal(t, 0.96, got.Extra["auto_pause_7d_threshold"])
 	require.Equal(t, true, got.Extra["auto_pause_5h_disabled"])
 	require.Equal(t, false, got.Extra["auto_pause_7d_disabled"])
+	require.Equal(t, account.Extra[service.AccountHealthProbeExtraKey], got.Extra[service.AccountHealthProbeExtraKey])
+	require.True(t, got.HasFailedHealthProbe())
 }
 
 func TestBuildSchedulerMetadataAccount_KeepsQuotaStateForCachedAccounts(t *testing.T) {

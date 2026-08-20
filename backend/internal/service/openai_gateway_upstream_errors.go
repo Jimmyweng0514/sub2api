@@ -138,9 +138,6 @@ func isOpenAITransientProcessingError(upstreamStatusCode int, upstreamMsg string
 		isOpenAICapacityShedMessage(string(upstreamBody)) {
 		return true
 	}
-	if upstreamStatusCode != http.StatusBadRequest && upstreamStatusCode != http.StatusServiceUnavailable {
-		return false
-	}
 	if upstreamStatusCode != http.StatusBadRequest {
 		return false
 	}
@@ -154,6 +151,10 @@ func isOpenAITransientProcessingError(upstreamStatusCode int, upstreamMsg string
 			return true
 		}
 		if strings.Contains(lower, "selected model is at capacity") {
+			return true
+		}
+		if strings.Contains(lower, "our servers are currently overloaded") ||
+			strings.Contains(lower, "servers are currently overloaded") {
 			return true
 		}
 		return strings.Contains(lower, "you can retry your request") &&
@@ -177,9 +178,12 @@ func isOpenAICapacityShedMessage(text string) bool {
 	lower := strings.ToLower(strings.TrimSpace(text))
 	return strings.Contains(lower, "server is overloaded") ||
 		strings.Contains(lower, "servers are overloaded") ||
-		strings.Contains(lower, "servers are currently overloaded")
+		strings.Contains(lower, "servers are currently overloaded") ||
+		strings.Contains(lower, "selected model is at capacity")
 }
 
+// Capacity shedding is a request/model-route condition. It may be retried on
+// the same account, but must not be recorded as an account health failure.
 func isOpenAIRequestScopedCapacityShed(upstreamMsg string, upstreamBody []byte) bool {
 	return isOpenAIUpstreamCapacityShedEvent(upstreamBody) ||
 		isOpenAICapacityShedMessage(upstreamMsg) ||

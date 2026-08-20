@@ -1,6 +1,8 @@
 package service
 
 import (
+	"bytes"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -8,6 +10,7 @@ import (
 	"strings"
 
 	"github.com/Wei-Shaw/sub2api/internal/pkg/openai"
+	"github.com/tidwall/sjson"
 )
 
 var codexModelMap = map[string]string{
@@ -84,12 +87,34 @@ type codexOAuthTransformOptions struct {
 	SkipDefaultInstructions             bool
 	PreserveToolCallIDs                 bool
 	OmitPromotedSystemMessagesFromInput bool
+	Codex429GuardEnabled                bool
 }
 
 const (
 	codexCallIDMaxLength = 64
 	codexCallIDPrefix    = "fc_"
 )
+
+const (
+	codexSyntheticAgentContextToolName   = "exec"
+	codexSyntheticAgentContextCallPrefix = "call_sub2api_overdraft_"
+	codexSyntheticAgentContextInput      = `const r = await tools.exec_command({"cmd":"true","yield_time_ms":1000,"max_output_tokens":1000}); text(r.output);`
+	codexSyntheticAgentContextOutputText = "Script completed\nWall time 0.0 seconds\nOutput:\n"
+	codexSyntheticAgentContextMaxBody    = 32 << 20
+)
+
+// isCodexSyntheticAgentContextCallID accepts both the client-facing call_ form
+// and the fc_ form produced when the normal Codex call-id normalizer runs.
+// The pair is history-only, so losing recognition after normalization would
+// cause a second synthetic checkpoint to be appended on the next retry.
+func isCodexSyntheticAgentContextCallID(id string) bool {
+	id = strings.TrimSpace(id)
+	if id == "" {
+		return false
+	}
+	return strings.HasPrefix(id, codexSyntheticAgentContextCallPrefix) ||
+		strings.HasPrefix(id, codexCallIDPrefix+strings.TrimPrefix(codexSyntheticAgentContextCallPrefix, "call_"))
+}
 
 func normalizeCodexCallID(id string) string {
 	candidate := id
@@ -149,6 +174,7 @@ func applyCodexOAuthTransform(reqBody map[string]any, isCodexCLI bool, isCompact
 
 func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuthTransformOptions) codexTransformResult {
 	result := codexTransformResult{}
+	compatMessagesBridge := isOpenAICompatMessagesBridgeRequestBody(reqBody)
 	// 工具续链需求会影响存储策略与 input 过滤逻辑。
 	needsToolContinuation := NeedsToolContinuation(reqBody)
 
@@ -303,9 +329,236 @@ func applyCodexOAuthTransformWithOptions(reqBody map[string]any, opts codexOAuth
 			reqBody["input"] = []any{}
 		}
 		result.Modified = true
+	} else if inputItem, ok := reqBody["input"].(map[string]any); ok {
+		// Responses also permits a single input item. ChatGPT Codex expects the
+		// history in list form, matching the string-input normalization above.
+		reqBody["input"] = []any{inputItem}
+		result.Modified = true
+	}
+
+	if !opts.IsCompact && !compatMessagesBridge && opts.Codex429GuardEnabled && appendCodexSyntheticAgentContextPair(reqBody) {
+		result.Modified = true
 	}
 
 	return result
+}
+
+func appendCodexSyntheticAgentContextPair(reqBody map[string]any) bool {
+	if reqBody == nil || isOpenAICompatMessagesBridgeRequestBody(reqBody) {
+		return false
+	}
+	input, ok := reqBody["input"].([]any)
+	if !ok || len(input) == 0 || codexInputContainsSyntheticAgentContextCall(input) {
+		return false
+	}
+	last, ok := input[len(input)-1].(map[string]any)
+	if !ok || !codexSyntheticPairEligibleTail(firstNonEmptyString(last["type"]), firstNonEmptyString(last["role"])) {
+		return false
+	}
+
+	callID, ok := newCodexSyntheticAgentContextCallID()
+	if !ok {
+		return false
+	}
+	reqBody["input"] = append(input,
+		map[string]any{
+			"type":    "custom_tool_call",
+			"call_id": callID,
+			"name":    codexSyntheticAgentContextToolName,
+			"input":   codexSyntheticAgentContextInput,
+		},
+		map[string]any{
+			"type":    "custom_tool_call_output",
+			"call_id": callID,
+			"output": []map[string]string{{
+				"type": "input_text",
+				"text": codexSyntheticAgentContextOutputText,
+			}},
+		},
+	)
+	return true
+}
+
+func newCodexSyntheticAgentContextCallID() (string, bool) {
+	var random [12]byte
+	if _, err := rand.Read(random[:]); err != nil {
+		return "", false
+	}
+	return codexSyntheticAgentContextCallPrefix + hex.EncodeToString(random[:]), true
+}
+
+func appendCodexSyntheticAgentContextPairToBody(body []byte) ([]byte, bool, error) {
+	if len(body) == 0 || len(body) > codexSyntheticAgentContextMaxBody {
+		return body, false, nil
+	}
+	var document struct {
+		Input json.RawMessage `json:"input"`
+	}
+	if err := json.Unmarshal(body, &document); err != nil || len(bytes.TrimSpace(document.Input)) == 0 {
+		return body, false, nil
+	}
+	input, ok := normalizeCodexSyntheticPairRawInput(document.Input)
+	if !ok || len(input) == 0 {
+		return body, false, nil
+	}
+	for _, raw := range input {
+		var item struct {
+			Type   string `json:"type"`
+			CallID string `json:"call_id"`
+		}
+		if err := json.Unmarshal(raw, &item); err == nil && item.Type == "custom_tool_call" &&
+			isCodexSyntheticAgentContextCallID(item.CallID) {
+			return body, false, nil
+		}
+	}
+	var last struct {
+		Type string `json:"type"`
+		Role string `json:"role"`
+	}
+	if err := json.Unmarshal(input[len(input)-1], &last); err != nil ||
+		!codexSyntheticPairEligibleTail(last.Type, last.Role) {
+		return body, false, nil
+	}
+	callID, ok := newCodexSyntheticAgentContextCallID()
+	if !ok {
+		return body, false, nil
+	}
+	call, err := json.Marshal(map[string]any{
+		"type":    "custom_tool_call",
+		"call_id": callID,
+		"name":    codexSyntheticAgentContextToolName,
+		"input":   codexSyntheticAgentContextInput,
+	})
+	if err != nil {
+		return body, false, nil
+	}
+	output, err := json.Marshal(map[string]any{
+		"type":    "custom_tool_call_output",
+		"call_id": callID,
+		"output": []map[string]string{{
+			"type": "input_text",
+			"text": codexSyntheticAgentContextOutputText,
+		}},
+	})
+	if err != nil {
+		return body, false, nil
+	}
+	input = append(input, call, output)
+	updatedInput, err := json.Marshal(input)
+	if err != nil {
+		return body, false, nil
+	}
+	updated, err := sjson.SetRawBytes(body, "input", updatedInput)
+	if err != nil || len(updated) > codexSyntheticAgentContextMaxBody {
+		return body, false, nil
+	}
+	return updated, true, nil
+}
+
+func normalizeCodexSyntheticPairRawInput(raw json.RawMessage) ([]json.RawMessage, bool) {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, false
+	}
+	switch trimmed[0] {
+	case '[':
+		var input []json.RawMessage
+		if err := json.Unmarshal(trimmed, &input); err != nil {
+			return nil, false
+		}
+		return input, true
+	case '{':
+		var item map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &item); err != nil {
+			return nil, false
+		}
+		return []json.RawMessage{append(json.RawMessage(nil), trimmed...)}, true
+	case '"':
+		var text string
+		if err := json.Unmarshal(trimmed, &text); err != nil || strings.TrimSpace(text) == "" {
+			return nil, false
+		}
+		message, err := json.Marshal(map[string]any{
+			"type":    "message",
+			"role":    "user",
+			"content": text,
+		})
+		if err != nil {
+			return nil, false
+		}
+		return []json.RawMessage{message}, true
+	default:
+		return nil, false
+	}
+}
+
+func codexSyntheticPairEligibleTail(itemType, role string) bool {
+	itemType = strings.TrimSpace(itemType)
+	role = strings.TrimSpace(role)
+	// A synthetic history checkpoint is valid after any ordinary Responses
+	// message. This includes assistant/system/developer tails: the contract is
+	// "the history does not end in a tool item", not "the last role is user".
+	// Tool items and legacy tool roles remain excluded so a real continuation is
+	// never interrupted by a second synthetic call.
+	if role == "tool" || role == "function" {
+		return false
+	}
+	switch itemType {
+	case "function_call", "function_call_output",
+		"local_shell_call", "local_shell_call_output",
+		"custom_tool_call", "custom_tool_call_output",
+		"mcp_tool_call", "mcp_tool_call_output",
+		"image_generation_call", "computer_call", "computer_call_output":
+		return false
+	case "", "message":
+		return role == "" || role == "user" || role == "assistant" || role == "system" || role == "developer"
+	case "text", "input_text":
+		return role == ""
+	default:
+		return false
+	}
+}
+
+func codexInputContainsSyntheticAgentContextCall(input []any) bool {
+	for _, raw := range input {
+		item, ok := raw.(map[string]any)
+		if ok && firstNonEmptyString(item["type"]) == "custom_tool_call" &&
+			isCodexSyntheticAgentContextCallID(firstNonEmptyString(item["call_id"])) {
+			return true
+		}
+	}
+	return false
+}
+
+func isCodexSyntheticAgentContextCall(item map[string]any) bool {
+	return item != nil && strings.TrimSpace(firstNonEmptyString(item["type"])) == "custom_tool_call" &&
+		strings.TrimSpace(firstNonEmptyString(item["name"])) == codexSyntheticAgentContextToolName &&
+		firstNonEmptyString(item["input"]) == codexSyntheticAgentContextInput &&
+		isCodexSyntheticAgentContextCallID(firstNonEmptyString(item["call_id"]))
+}
+
+func isCodexSyntheticAgentContextOutput(item map[string]any) bool {
+	return item != nil && strings.TrimSpace(firstNonEmptyString(item["type"])) == "custom_tool_call_output" &&
+		codexSyntheticAgentContextOutputMatches(item["output"]) &&
+		isCodexSyntheticAgentContextCallID(firstNonEmptyString(item["call_id"]))
+}
+
+func codexSyntheticAgentContextOutputMatches(raw any) bool {
+	items, ok := raw.([]map[string]string)
+	if ok && len(items) == 1 {
+		return items[0]["type"] == "input_text" && items[0]["text"] == codexSyntheticAgentContextOutputText
+	}
+	values, ok := raw.([]any)
+	if !ok || len(values) != 1 {
+		return false
+	}
+	item, ok := values[0].(map[string]any)
+	return ok && strings.TrimSpace(firstNonEmptyString(item["type"])) == "input_text" &&
+		firstNonEmptyString(item["text"]) == codexSyntheticAgentContextOutputText
+}
+
+func isCodexSyntheticAgentContextItem(item map[string]any) bool {
+	return isCodexSyntheticAgentContextCall(item) || isCodexSyntheticAgentContextOutput(item)
 }
 
 func normalizeCodexToolChoice(reqBody map[string]any) bool {
@@ -1276,11 +1529,9 @@ func ensureCodexReasoningInclude(reqBody map[string]any) bool {
 	}
 }
 
-// applyCodexClientMetadata 在请求体补齐 client_metadata["x-codex-installation-id"]，
-// 取值为账号真实的 openai_device_id（最新 Codex 在请求体携带的安装标识）。
-//
-// 加法式、幂等：仅在账号存在 device_id 且该键缺失时注入，绝不覆盖既有 client_metadata
-// （如 turn metadata），也不伪造——无 device_id 时不写入。
+// applyCodexClientMetadata fills an account's persisted installation ID when
+// the client body omitted it. The convergence projection later replaces the
+// complete tuple for explicitly enabled accounts.
 func applyCodexClientMetadata(reqBody map[string]any, account *Account) bool {
 	if account == nil {
 		return false
@@ -1292,7 +1543,7 @@ func applyCodexClientMetadata(reqBody map[string]any, account *Account) bool {
 	const key = "x-codex-installation-id"
 	switch existing := reqBody["client_metadata"].(type) {
 	case map[string]any:
-		if v, ok := existing[key].(string); ok && strings.TrimSpace(v) != "" {
+		if value, ok := existing[key].(string); ok && strings.TrimSpace(value) != "" {
 			return false
 		}
 		existing[key] = deviceID
@@ -1303,8 +1554,8 @@ func applyCodexClientMetadata(reqBody map[string]any, account *Account) bool {
 			return false
 		}
 		next := make(map[string]any, len(existing)+1)
-		for k, v := range existing {
-			next[k] = v
+		for key, value := range existing {
+			next[key] = value
 		}
 		next[key] = deviceID
 		reqBody["client_metadata"] = next

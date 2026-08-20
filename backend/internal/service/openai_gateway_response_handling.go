@@ -54,6 +54,9 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		firstOutputTimeout = s.openAIFirstOutputTimeout(reasoningEffort)
 	}
 	guardFirstOutput := firstOutputTimeout > 0
+	// Capacity-shed events can arrive after protocol preambles even when the
+	// optional first-token timeout is disabled. Stage all OpenAI SSE output
+	// until the first semantic event so those responses remain failover-safe.
 	stageFirstOutput := account != nil && account.Platform == PlatformOpenAI
 	var attemptResponseHeaders http.Header
 	if stageFirstOutput {
@@ -67,11 +70,22 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	}
 	// x-codex-turn-state 不在通用响应头白名单内，按 Codex 协议显式回传：
 	// 客户端会在同回合的后续请求中回带（openai_codex_turn_state.go）。
-	// OpenAI 首个语义输出前只暂存，溯源在 applyAttemptResponseHeaders 真正提交时记录。
+	// 首输出守卫模式下只暂存，溯源在 applyAttemptResponseHeaders 真正提交时记录。
 	if stageFirstOutput {
 		stageOpenAICodexTurnState(&attemptResponseHeaders, resp.Header)
 	} else {
 		s.relayOpenAICodexTurnState(c, account, resp.Header)
+	}
+	turnStateProvenanceNoted := false
+	noteTurnStateProvenance := func() {
+		if turnStateProvenanceNoted || !stageFirstOutput || attemptResponseHeaders == nil {
+			return
+		}
+		if extractOpenAICodexTurnState(attemptResponseHeaders) == "" {
+			return
+		}
+		s.noteStagedOpenAICodexTurnStateCommitted(c, account, attemptResponseHeaders)
+		turnStateProvenanceNoted = true
 	}
 
 	// Set SSE response headers
@@ -96,7 +110,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		}
 		// 暂存头此刻才真正写给客户端：turn-state 溯源在这里记录（见
 		// noteStagedOpenAICodexTurnStateCommitted 的 failover 说明）。
-		s.noteStagedOpenAICodexTurnStateCommitted(c, account, attemptResponseHeaders)
+		noteTurnStateProvenance()
 		// These headers describe this gateway's SSE stream and are stable across
 		// account attempts. Keep them authoritative over upstream values.
 		c.Header("Content-Type", "text/event-stream")
@@ -149,6 +163,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 		}
 		flusher.Flush()
+		noteTurnStateProvenance()
 		return nil
 	}
 
@@ -245,6 +260,15 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 	capacityFailoverSuppressedLogged := false
 	failedMessage := ""
 	clientOutputStarted := false
+	clientOutputCommitted := func() bool {
+		// Native OpenAI staging writes heartbeat comments directly to the
+		// underlying writer. Those bytes keep the HTTP connection alive but are
+		// not semantic output and must not suppress pre-output failover.
+		if stageFirstOutput {
+			return clientOutputStarted
+		}
+		return openAIStreamClientOutputStarted(c, clientOutputStarted)
+	}
 	upstreamRequestID := strings.TrimSpace(resp.Header.Get("x-request-id"))
 	var streamEarlyErr error
 	eventInProgress := false
@@ -359,8 +383,8 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 		if sawTerminalEvent && !sawFailedEvent {
 			s.clearOpenAIProxyStreamDisconnect(account)
 		}
-		if !sawTerminalEvent && !openAIStreamClientOutputStarted(c, clientOutputStarted) && !eventShouldFlush {
-			return resultWithUsage(), s.newOpenAIStreamFailoverError(
+		if !sawTerminalEvent && !clientOutputCommitted() && !eventShouldFlush {
+			failoverErr := s.newOpenAIStreamFailoverError(
 				c,
 				account,
 				false,
@@ -368,10 +392,14 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 				nil,
 				"OpenAI stream ended before a terminal event",
 			)
+			if stageFirstOutput {
+				failoverErr.SafeToFailoverAfterWrite = true
+			}
+			return resultWithUsage(), failoverErr
 		}
 		flushPending("Client disconnected during final flush, returning collected usage")
 		if !sawTerminalEvent {
-			if openAIStreamClientOutputStarted(c, clientOutputStarted) && !clientDisconnected {
+			if clientOutputCommitted() && !clientDisconnected {
 				s.recordOpenAIProxyStreamDisconnect(account, errors.New("stream ended before terminal event"), upstreamRequestID)
 			}
 			return resultWithUsage(), fmt.Errorf("stream usage incomplete: missing terminal event")
@@ -424,7 +452,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			sendErrorEvent("response_too_large")
 			return resultWithUsage(), scanErr, true
 		}
-		if !openAIStreamClientOutputStarted(c, clientOutputStarted) && !eventShouldFlush {
+		if !clientOutputCommitted() && !eventShouldFlush {
 			msg := "OpenAI stream disconnected before completion"
 			if errText := strings.TrimSpace(scanErr.Error()); errText != "" {
 				msg += ": " + errText
@@ -459,23 +487,18 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			forceFlushFailedEvent := false
 			if !capacityFailoverSuppressedLogged && account != nil && account.Platform == PlatformOpenAI &&
 				(eventType == "error" || eventType == "response.failed") &&
-				openAIStreamClientOutputStarted(c, clientOutputStarted) &&
+				clientOutputCommitted() &&
 				isOpenAIUpstreamCapacityShedEvent(dataBytes) {
 				logOpenAICapacityFailoverSuppressed(ctx, account, "native_sse", upstreamRequestID, eventType)
 				capacityFailoverSuppressedLogged = true
 			}
-			if eventType == "error" && !openAIStreamClientOutputStarted(c, clientOutputStarted) {
+			if eventType == "error" && !clientOutputCommitted() {
 				errorMessage := extractOpenAISSEErrorMessage(dataBytes)
 				if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, errorMessage); matched {
 					s.recordOpenAIStreamUpstreamError(c, account, false, upstreamRequestID, "http_error", dataBytes, errorMessage)
 					MarkResponseCommitted(c)
 					c.Writer.Header().Set("Content-Type", "application/json; charset=utf-8")
-					c.JSON(status, gin.H{
-						"error": gin.H{
-							"type":    errType,
-							"message": errMsg,
-						},
-					})
+					c.JSON(status, gin.H{"error": gin.H{"type": errType, "message": errMsg}})
 					streamEarlyErr = fmt.Errorf("upstream error event: passthrough rule matched message=%s", errMsg)
 					return
 				}
@@ -500,7 +523,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 						UpstreamOutTok: usage.OutputTokens,
 					})
 				}
-				if !openAIStreamClientOutputStarted(c, clientOutputStarted) {
+				if !clientOutputCommitted() {
 					if status, errType, errMsg, matched := applyOpenAIStreamFailedErrorPassthroughRule(c, account.Platform, dataBytes, failedMessage); matched {
 						sawFailedEvent = true
 						// 命中透传规则也要记录 ops 上游错误事件（对齐 CC/Messages 与
@@ -575,7 +598,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			if sanitizedData, sanitized := sanitizeOpenAIResponseFailedEventForClient(
 				dataBytes,
 				eventType,
-				openAIStreamClientOutputStarted(c, clientOutputStarted),
+				clientOutputCommitted(),
 			); sanitized {
 				dataBytes = sanitizedData
 				data = string(sanitizedData)
@@ -586,7 +609,14 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			if needModelReplace && mappedModel != "" && strings.Contains(line, mappedModel) {
 				line = s.replaceModelInSSELine(line, mappedModel, originalModel)
 			}
-			startsClientOutput := forceFlushFailedEvent || openAIStreamDataStartsClientOutput(data, eventType)
+			startsClientOutput := forceFlushFailedEvent
+			if !forceFlushFailedEvent {
+				if stageFirstOutput {
+					startsClientOutput = openAIStreamDataStartsClientOutputForStaging(data, eventType)
+				} else {
+					startsClientOutput = openAIStreamDataStartsClientOutputForLegacy(data, eventType)
+				}
+			}
 			startsVisibleOutput := openAIStreamDataStartsVisibleOutput(data, eventType)
 			if stageFirstOutput {
 				eventStartsClientOutput = eventStartsClientOutput || startsClientOutput
@@ -629,7 +659,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			}
 
 			// Record first token time
-			if !guardFirstOutput && firstTokenMs == nil && startsVisibleOutput {
+			if !stageFirstOutput && firstTokenMs == nil && startsVisibleOutput {
 				ms := int(time.Since(startTime).Milliseconds())
 				firstTokenMs = &ms
 				stopFirstOutputTimer()
@@ -783,7 +813,7 @@ func (s *OpenAIGatewayService) handleStreamingResponseWithReasoning(ctx context.
 			// legacy stream_timeout path so partial SSE is not dual-written.
 			if account != nil && account.Platform == PlatformGrok {
 				s.tempUnscheduleGrok(ctx, account, grokStreamIdleCooldown, "grok stream idle timeout")
-				if !openAIStreamClientOutputStarted(c, clientOutputStarted) && !eventShouldFlush {
+				if !clientOutputCommitted() && !eventShouldFlush {
 					_ = resp.Body.Close()
 					return resultWithUsage(), grokStreamIdleFailoverError(account, streamInterval)
 				}
@@ -1279,7 +1309,7 @@ func (s *OpenAIGatewayService) handleNonStreamingResponse(ctx context.Context, r
 	// This heuristic is NOT applied to API-key accounts to avoid false
 	// positives on JSON responses that coincidentally contain "data:" or
 	// "event:" in their text content.
-	if account.Type == AccountTypeOAuth && bodyLooksLikeSSE {
+	if account != nil && account.Type == AccountTypeOAuth && bodyLooksLikeSSE {
 		return s.handleSSEToJSON(resp, c, account, body, originalModel, mappedModel)
 	}
 	if account != nil && account.IsGrok() && isOpenAIResponsesCompactPath(c) {
@@ -1398,6 +1428,9 @@ func (s *OpenAIGatewayService) handleSSEToJSON(resp *http.Response, c *gin.Conte
 			msg := extractOpenAISSEErrorMessage(terminalPayload)
 			if msg == "" {
 				msg = "Upstream compact response failed"
+			}
+			if failoverErr := s.nonStreamingFailedEventFailover(c, account, false, resp, terminalPayload, msg); failoverErr != nil {
+				return nil, failoverErr
 			}
 			return nil, s.writeOpenAINonStreamingProtocolError(resp, c, msg)
 		}
@@ -1674,7 +1707,8 @@ func responsesStreamEventMayContributeToOutput(eventType string) bool {
 func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
 	var items []json.RawMessage
 	seen := make(map[string]struct{})
-	hasCompactionItem := false
+	var addedCompactionItems []json.RawMessage
+	doneCompaction := false
 	appendItem := func(item gjson.Result) {
 		if !item.Exists() || !item.IsObject() {
 			return
@@ -1687,34 +1721,43 @@ func collectRawResponsesOutputItemsFromSSE(bodyText string) ([]byte, bool) {
 			return
 		}
 		seen[key] = struct{}{}
-		if isResponsesCompactionItemType(item.Get("type").String()) {
-			hasCompactionItem = true
-		}
 		items = append(items, json.RawMessage(item.Raw))
 	}
 	forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
 		if normalized, changed := normalizeCompletedImageGenerationStatus(data); changed {
 			data = normalized
 		}
-		if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.done" {
-			return
+		switch strings.TrimSpace(gjson.GetBytes(data, "type").String()) {
+		case "response.output_item.done":
+			item := gjson.GetBytes(data, "item")
+			if isResponsesCompactionItemType(item.Get("type").String()) {
+				doneCompaction = true
+			}
+			appendItem(item)
+		case "response.output_item.added":
+			item := gjson.GetBytes(data, "item")
+			if item.IsObject() && isResponsesCompactionItemType(item.Get("type").String()) {
+				addedCompactionItems = append(addedCompactionItems, json.RawMessage(item.Raw))
+			}
 		}
-		appendItem(gjson.GetBytes(data, "item"))
 	})
 	// done 事件未携带 compaction item 时再看 added：覆盖"其他 item 有 done、
 	// compaction 只在 added 中"的混合形态；done 已含 compaction 时跳过，
 	// 避免同一 item 在无 id 可去重时被收集两份（Codex 要求恰好一个）。
-	if !hasCompactionItem {
-		forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
-			if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.added" {
-				return
+	if !doneCompaction && len(addedCompactionItems) > 0 {
+		var fallback json.RawMessage
+		for _, candidate := range addedCompactionItems {
+			if strings.TrimSpace(gjson.GetBytes(candidate, "encrypted_content").String()) != "" {
+				fallback = candidate
+				break
 			}
-			item := gjson.GetBytes(data, "item")
-			if !isResponsesCompactionItemType(item.Get("type").String()) {
-				return
+			if len(fallback) == 0 {
+				fallback = candidate
 			}
-			appendItem(item)
-		})
+		}
+		if len(fallback) > 0 {
+			appendItem(gjson.ParseBytes(fallback))
+		}
 	}
 	if len(items) == 0 {
 		return nil, false
@@ -1780,26 +1823,21 @@ func responsesOutputHasCompactionItem(response []byte) bool {
 // item 的 raw JSON：output_item.done 优先，output_item.added 兜底。
 func findRawCompactionItemFromSSE(bodyText string) (json.RawMessage, bool) {
 	var found json.RawMessage
-	pick := func(eventType string) {
-		forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
-			if found != nil {
-				return
-			}
-			if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != eventType {
-				return
-			}
-			item := gjson.GetBytes(data, "item")
-			if !item.IsObject() || !isResponsesCompactionItemType(item.Get("type").String()) {
-				return
-			}
+	count := 0
+	forEachOpenAISSEDataPayload(bodyText, func(data []byte) {
+		if strings.TrimSpace(gjson.GetBytes(data, "type").String()) != "response.output_item.done" {
+			return
+		}
+		item := gjson.GetBytes(data, "item")
+		if !item.IsObject() || !isResponsesCompactionItemType(item.Get("type").String()) {
+			return
+		}
+		count++
+		if count == 1 {
 			found = json.RawMessage(item.Raw)
-		})
-	}
-	pick("response.output_item.done")
-	if found == nil {
-		pick("response.output_item.added")
-	}
-	return found, found != nil
+		}
+	})
+	return found, count == 1
 }
 
 // reconstructResponseOutputFromSSE scans raw SSE body text and returns a

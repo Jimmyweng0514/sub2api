@@ -425,9 +425,15 @@ func TestOpenAIWSHTTPBridgeDecisionKeepsSmallFramesOnWS(t *testing.T) {
 		},
 	}
 
-	require.False(t, svc.shouldBridgeOpenAIWSHTTP(nil, 99, ""))
-	require.True(t, svc.shouldBridgeOpenAIWSHTTP(nil, 100, ""))
-	require.False(t, svc.shouldBridgeOpenAIWSHTTP(nil, 1000, "resp_existing"))
+	t.Run("small first frame stays on websocket", func(t *testing.T) {
+		require.False(t, svc.shouldBridgeOpenAIWSHTTP(nil, 99, ""))
+	})
+	t.Run("oversized first frame without previous response uses bridge", func(t *testing.T) {
+		require.True(t, svc.shouldBridgeOpenAIWSHTTP(nil, 100, ""))
+	})
+	t.Run("previous response keeps websocket continuation", func(t *testing.T) {
+		require.False(t, svc.shouldBridgeOpenAIWSHTTP(nil, 1000, "resp_existing"))
+	})
 
 	svc.cfg.Gateway.OpenAIWS.HTTPBridgeEnabled = false
 	require.False(t, svc.shouldBridgeOpenAIWSHTTP(nil, 1000, ""))
@@ -585,6 +591,39 @@ func TestProxyOpenAIWSHTTPBridgeTurnSSEErrorFailoverSafety(t *testing.T) {
 	}
 }
 
+func TestProxyOpenAIWSHTTPBridgeTurnSSEErrorText429IsConfirmed(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	upstream := &httpUpstreamRecorder{resp: &http.Response{
+		StatusCode: http.StatusOK,
+		Header:     make(http.Header),
+		Body: io.NopCloser(strings.NewReader(
+			"data: {\"type\":\"error\",\"error\":{\"message\":\"exceeded retry limit, last status: 429 Too Many Requests\"}}\n\n",
+		)),
+	}}
+	svc := &OpenAIGatewayService{cfg: &config.Config{}, httpUpstream: upstream}
+	account := &Account{ID: 101, Platform: PlatformOpenAI, Type: AccountTypeAPIKey, Concurrency: 1}
+	recorder := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(recorder)
+	c.Request = httptest.NewRequest(http.MethodGet, "/v1/responses", nil)
+	payload := []byte(`{"type":"response.create","model":"gpt-5","input":"hi"}`)
+	var writes [][]byte
+
+	result, err := svc.proxyOpenAIWSHTTPBridgeTurn(
+		context.Background(), c, account, "sk-test", payload, len(payload),
+		"gpt-5", "", "", "", "", 1,
+		func(message []byte) error {
+			writes = append(writes, append([]byte(nil), message...))
+			return nil
+		},
+	)
+
+	var failoverErr *UpstreamFailoverError
+	require.Nil(t, result)
+	require.ErrorAs(t, err, &failoverErr)
+	require.Equal(t, http.StatusTooManyRequests, failoverErr.StatusCode)
+	require.Empty(t, writes)
+}
+
 // 桥接转发 error / response.failed 给 WS 客户端前必须把容量降载码改写为可重试
 // 的 server_error：Codex 对 server_is_overloaded/slow_down 判致命并终止会话。
 // 账号状态判定使用改写前的原始事件，不受影响。
@@ -604,7 +643,8 @@ func TestProxyOpenAIWSHTTPBridgeTurnRewritesCapacityShedCodeForClient(t *testing
 			wantErr: true,
 		},
 		{
-			// 后续 turn 不允许 replay，容量错误必须改写后交给客户端重试。
+			// A capacity failure on a follow-up turn is relayed after code rewrite;
+			// only an explicit 429 is eligible for the upstream replay path.
 			name: "turn2_bare_response_failed",
 			turn: 2,
 			body: "data: {\"type\":\"response.failed\",\"response\":{\"id\":\"resp_shed\",\"status\":\"failed\",\"error\":{\"code\":\"server_is_overloaded\",\"message\":\"Our servers are currently overloaded. Please try again later.\"}}}\n\n",
@@ -747,6 +787,7 @@ func TestProxyOpenAIWSHTTPBridgeTurnRequiresTerminalEvent(t *testing.T) {
 			body: "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_truncated\"}}\n\n" +
 				"data: [DONE]\n\n",
 			wantFailover: true,
+			wantWrites:   0,
 		},
 	}
 	for _, tt := range tests {
@@ -1108,7 +1149,7 @@ func TestProxyResponsesWebSocketFromClientForGrokUsesXAIHTTPBridgeAndPreservesMa
 		ginCtx.Request = req
 		ginCtx.Set("api_key", &APIKey{ID: 7101})
 
-		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "access-token", firstMessage, &OpenAIWSIngressHooks{
+		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "access-token", firstMessage, &OpenAIWSIngressHooks{
 			MapRequestModel: func(_ int, originalModel string) (string, error) {
 				if originalModel == "channel-alias" {
 					return "grok-4.3", nil
@@ -1116,6 +1157,7 @@ func TestProxyResponsesWebSocketFromClientForGrokUsesXAIHTTPBridgeAndPreservesMa
 				return originalModel, nil
 			},
 		})
+
 	}))
 	defer wsServer.Close()
 
@@ -1211,7 +1253,7 @@ func TestProxyResponsesWebSocketFromClientForGrokUsesXAIHTTPBridgeAndPreservesMa
 	require.False(t, gjson.GetBytes(upstream.lastBody, "prompt_cache_retention").Exists())
 }
 
-func TestOpenAIWSHTTPBridgeAcceptsFirstFrameAboveLegacy16MiB(t *testing.T) {
+func TestOpenAIWSHTTPBridgeAcceptsOversizedPassthroughFirstFrame(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	sseBody := strings.Join([]string{
@@ -1235,16 +1277,21 @@ func TestOpenAIWSHTTPBridgeAcceptsFirstFrameAboveLegacy16MiB(t *testing.T) {
 				Enabled:                  true,
 				APIKeyEnabled:            true,
 				ResponsesWebsocketsV2:    true,
+				ModeRouterV2Enabled:      true,
+				IngressModeDefault:       OpenAIWSIngressModeCtxPool,
 				ClientReadLimitBytes:     64 * 1024 * 1024,
 				HTTPBridgeEnabled:        true,
 				HTTPBridgeThresholdBytes: 15 * 1024 * 1024,
 			},
 		},
 	}
+	passthroughDialer := &openAIWSCaptureDialer{conn: &openAIWSCaptureConn{}}
 	svc := &OpenAIGatewayService{
-		cfg:           cfg,
-		httpUpstream:  upstream,
-		toolCorrector: NewCodexToolCorrector(),
+		cfg:                       cfg,
+		httpUpstream:              upstream,
+		toolCorrector:             NewCodexToolCorrector(),
+		openaiWSResolver:          NewOpenAIWSProtocolResolver(cfg),
+		openaiWSPassthroughDialer: passthroughDialer,
 	}
 	account := &Account{
 		ID:          9,
@@ -1253,7 +1300,7 @@ func TestOpenAIWSHTTPBridgeAcceptsFirstFrameAboveLegacy16MiB(t *testing.T) {
 		Type:        AccountTypeAPIKey,
 		Credentials: map[string]any{"api_key": "sk-upstream"},
 		Extra: map[string]any{
-			"openai_apikey_responses_websockets_v2_enabled": true,
+			"openai_apikey_responses_websockets_v2_mode": OpenAIWSIngressModePassthrough,
 		},
 		Concurrency: 1,
 		Status:      StatusActive,
@@ -1294,7 +1341,7 @@ func TestOpenAIWSHTTPBridgeAcceptsFirstFrameAboveLegacy16MiB(t *testing.T) {
 
 		proxyCtx, cancelProxy := context.WithTimeout(r.Context(), 20*time.Second)
 		defer cancelProxy()
-		errCh <- svc.ProxyResponsesWebSocketFromClient(proxyCtx, ginCtx, conn, account, "sk-test", firstMessage, nil)
+		errCh <- svc.ProxyResponsesWebSocketFromClient(proxyCtx, ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 
@@ -1341,6 +1388,7 @@ func TestOpenAIWSHTTPBridgeAcceptsFirstFrameAboveLegacy16MiB(t *testing.T) {
 	require.False(t, gjson.GetBytes(upstream.lastBody, "generate").Exists())
 	require.True(t, gjson.GetBytes(upstream.lastBody, "stream").Bool())
 	require.Equal(t, "gpt-5", gjson.GetBytes(upstream.lastBody, "model").String())
+	require.Equal(t, 0, passthroughDialer.DialCount(), "oversized passthrough first frame must not open an upstream websocket")
 }
 
 func TestOpenAIWSHTTPBridgeKeepsContinuationFramesOnHTTPWithoutPreviousResponseID(t *testing.T) {
@@ -1442,7 +1490,7 @@ func TestOpenAIWSHTTPBridgeKeepsContinuationFramesOnHTTPWithoutPreviousResponseI
 		req.Header.Set("User-Agent", "codex_cli_rs/0.135.0")
 		ginCtx.Request = req
 
-		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 
@@ -1562,7 +1610,7 @@ func TestOpenAIWSHTTPBridge_IdleTimeoutClosesClientSession(t *testing.T) {
 		rec := httptest.NewRecorder()
 		ginCtx, _ := gin.CreateTestContext(rec)
 		ginCtx.Request = r.Clone(r.Context())
-		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, account, "sk-test", firstMessage, nil)
+		errCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 

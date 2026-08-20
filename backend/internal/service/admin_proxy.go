@@ -4,7 +4,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
@@ -14,7 +16,53 @@ import (
 	"github.com/Wei-Shaw/sub2api/internal/util/httputil"
 )
 
+func (s *adminServiceImpl) openAIWSConnectionInvalidator() OpenAIWSConnectionInvalidator {
+	if s == nil || s.runtimeBlocker == nil {
+		return nil
+	}
+	invalidator, _ := s.runtimeBlocker.(OpenAIWSConnectionInvalidator)
+	return invalidator
+}
+
+func (s *adminServiceImpl) invalidateOpenAIWSConnectionsForProxy(ctx context.Context, proxyID int64) {
+	if s == nil || s.proxyRepo == nil {
+		return
+	}
+	invalidator := s.openAIWSConnectionInvalidator()
+	if invalidator == nil {
+		return
+	}
+	if err := invalidateOpenAIWSConnectionsForProxy(ctx, s.proxyRepo, invalidator, proxyID); err != nil {
+		slog.Warn("failed to invalidate OpenAI websocket connections after proxy mutation", "proxy_id", proxyID, "error", err)
+	}
+}
+
+func (s *adminServiceImpl) proxyAccountSummariesForInvalidation(ctx context.Context, proxyID int64, invalidator OpenAIWSConnectionInvalidator) []ProxyAccountSummary {
+	if s == nil || s.proxyRepo == nil || invalidator == nil || proxyID <= 0 {
+		return nil
+	}
+	summaries, err := listProxyAccountSummaries(ctx, s.proxyRepo, proxyID)
+	if err != nil {
+		slog.Warn("failed to list accounts before proxy mutation", "proxy_id", proxyID, "error", err)
+		return nil
+	}
+	return summaries
+}
+
 // Proxy management implementations
+func normalizeProxyFallbackMode(mode string) (string, error) {
+	normalized := strings.TrimSpace(mode)
+	if normalized == "" {
+		return FallbackModeNone, nil
+	}
+	switch normalized {
+	case FallbackModeNone, FallbackModeProxy, FallbackModeDirect:
+		return normalized, nil
+	default:
+		return "", infraerrors.BadRequest("PROXY_FALLBACK_MODE_INVALID", "fallback_mode must be one of none, proxy, or direct")
+	}
+}
+
 func (s *adminServiceImpl) ListProxies(ctx context.Context, page, pageSize int, protocol, status, search string, sortBy, sortOrder string) ([]Proxy, int64, error) {
 	params := pagination.PaginationParams{Page: page, PageSize: pageSize, SortBy: sortBy, SortOrder: sortOrder}
 	proxies, result, err := s.proxyRepo.ListWithFilters(ctx, params, protocol, status, search)
@@ -57,9 +105,9 @@ func (s *adminServiceImpl) GetProxiesByIDs(ctx context.Context, ids []int64) ([]
 
 func (s *adminServiceImpl) CreateProxy(ctx context.Context, input *CreateProxyInput) (*Proxy, error) {
 	// 规范化 fallback_mode
-	mode := input.FallbackMode
-	if mode == "" {
-		mode = FallbackModeNone
+	mode, err := normalizeProxyFallbackMode(input.FallbackMode)
+	if err != nil {
+		return nil, err
 	}
 	// 校验：mode=proxy 必须有 backup
 	if mode == FallbackModeProxy && input.BackupProxyID == nil {
@@ -96,9 +144,9 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 		return nil, infraerrors.BadRequest("PROXY_BACKUP_SELF", "backup proxy cannot be itself")
 	}
 	// 规范化 fallback_mode
-	mode := input.FallbackMode
-	if mode == "" {
-		mode = FallbackModeNone
+	mode, err := normalizeProxyFallbackMode(input.FallbackMode)
+	if err != nil {
+		return nil, err
 	}
 	// 校验：mode=proxy 必须有 backup
 	if mode == FallbackModeProxy && input.BackupProxyID == nil {
@@ -143,6 +191,7 @@ func (s *adminServiceImpl) UpdateProxy(ctx context.Context, id int64, input *Upd
 	if err := s.proxyRepo.Update(ctx, proxy); err != nil {
 		return nil, err
 	}
+	s.invalidateOpenAIWSConnectionsForProxy(ctx, id)
 	return proxy, nil
 }
 
@@ -154,7 +203,14 @@ func (s *adminServiceImpl) DeleteProxy(ctx context.Context, id int64) error {
 	if count > 0 {
 		return ErrProxyInUse
 	}
-	return s.proxyRepo.Delete(ctx, id)
+
+	invalidator := s.openAIWSConnectionInvalidator()
+	summaries := s.proxyAccountSummariesForInvalidation(ctx, id, invalidator)
+	if err := s.proxyRepo.Delete(ctx, id); err != nil {
+		return err
+	}
+	notifyOpenAIWSConnectionsInvalidator(invalidator, summaries)
+	return nil
 }
 
 func (s *adminServiceImpl) BatchDeleteProxies(ctx context.Context, ids []int64) (*ProxyBatchDeleteResult, error) {
@@ -179,6 +235,8 @@ func (s *adminServiceImpl) BatchDeleteProxies(ctx context.Context, ids []int64) 
 			})
 			continue
 		}
+		invalidator := s.openAIWSConnectionInvalidator()
+		summaries := s.proxyAccountSummariesForInvalidation(ctx, id, invalidator)
 		if err := s.proxyRepo.Delete(ctx, id); err != nil {
 			result.Skipped = append(result.Skipped, ProxyBatchDeleteSkipped{
 				ID:     id,
@@ -186,6 +244,7 @@ func (s *adminServiceImpl) BatchDeleteProxies(ctx context.Context, ids []int64) 
 			})
 			continue
 		}
+		notifyOpenAIWSConnectionsInvalidator(invalidator, summaries)
 		result.DeletedIDs = append(result.DeletedIDs, id)
 	}
 

@@ -20,20 +20,21 @@ import (
 
 // RateLimitService 处理限流和过载状态管理
 type RateLimitService struct {
-	accountRepo           AccountRepository
-	usageRepo             UsageLogRepository
-	cfg                   *config.Config
-	geminiQuotaService    *GeminiQuotaService
-	tempUnschedCache      TempUnschedCache
-	timeoutCounterCache   TimeoutCounterCache
-	openAI403CounterCache OpenAI403CounterCache
-	settingService        *SettingService
-	tokenCacheInvalidator TokenCacheInvalidator
-	runtimeBlocker        AccountRuntimeBlocker
-	usageCacheMu          sync.RWMutex
-	usageCache            map[int64]*geminiUsageCacheEntry
-
-	// OpenAI Team 联动熔断的进程内去重：teamID → 去重窗口截止时间
+	accountRepo            AccountRepository
+	usageRepo              UsageLogRepository
+	cfg                    *config.Config
+	geminiQuotaService     *GeminiQuotaService
+	tempUnschedCache       TempUnschedCache
+	timeoutCounterCache    TimeoutCounterCache
+	openAI429CounterCache  OpenAI429CounterCache
+	openAI403CounterCache  OpenAI403CounterCache
+	settingService         *SettingService
+	tokenCacheInvalidator  TokenCacheInvalidator
+	runtimeBlocker         AccountRuntimeBlocker
+	usageCacheMu           sync.RWMutex
+	usageCache             map[int64]*geminiUsageCacheEntry
+	openAI429Locks         sync.Map
+	openAI429Streak        sync.Map
 	openaiTeamLinkedMu     sync.Mutex
 	openaiTeamLinkedRecent map[string]time.Time
 }
@@ -78,6 +79,10 @@ const (
 
 var openAIImageTryAgainPattern = regexp.MustCompile(`(?i)try again in\s+([0-9]+(?:\.[0-9]+)?)\s*(ms|s|sec|secs|second|seconds|m|min|mins|minute|minutes)`)
 
+var openCodeGoUsageLimitResetPattern = regexp.MustCompile(`(?i)\bresets\s+in\s+`)
+
+var openCodeGoUsageLimitDurationPartPattern = regexp.MustCompile(`(?i)^([0-9]+(?:\.[0-9]+)?)\s*(s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days|w|week|weeks)\b`)
+
 const (
 	openAI403CooldownMinutesDefault = 10
 	openAI403DisableThreshold       = 3
@@ -87,13 +92,103 @@ const (
 // NewRateLimitService 创建RateLimitService实例
 func NewRateLimitService(accountRepo AccountRepository, usageRepo UsageLogRepository, cfg *config.Config, geminiQuotaService *GeminiQuotaService, tempUnschedCache TempUnschedCache) *RateLimitService {
 	return &RateLimitService{
-		accountRepo:        accountRepo,
-		usageRepo:          usageRepo,
-		cfg:                cfg,
-		geminiQuotaService: geminiQuotaService,
-		tempUnschedCache:   tempUnschedCache,
-		usageCache:         make(map[int64]*geminiUsageCacheEntry),
+		accountRepo:            accountRepo,
+		usageRepo:              usageRepo,
+		cfg:                    cfg,
+		geminiQuotaService:     geminiQuotaService,
+		tempUnschedCache:       tempUnschedCache,
+		usageCache:             make(map[int64]*geminiUsageCacheEntry),
+		openaiTeamLinkedRecent: make(map[string]time.Time),
 	}
+}
+
+func (s *RateLimitService) confirmOpenAIOAuth429Context(ctx context.Context, accountID int64, now time.Time) bool {
+	if s == nil || accountID <= 0 {
+		return false
+	}
+	mu := s.openAI429AccountLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	state := openAIOAuth429StreakState{}
+	if raw, ok := s.openAI429Streak.Load(accountID); ok {
+		state, _ = raw.(openAIOAuth429StreakState)
+	}
+	if state.UpdatedAt.IsZero() || now.Sub(state.UpdatedAt) > openAIOAuth429ConfirmationWindow || now.Before(state.UpdatedAt) {
+		state.Count = 0
+		state.UpdatedAt = time.Time{}
+	}
+
+	if state.RemoteResetPending && s.openAI429CounterCache != nil {
+		if err := s.openAI429CounterCache.ResetOpenAI429Count(ctx, accountID); err != nil {
+			slog.Warn("openai_429_confirmation_reset_retry_failed", "account_id", accountID, "error", err)
+		} else {
+			// The remote counter belongs to the streak before the successful
+			// response. Keep locally observed 429s from the new generation; only
+			// the stale remote generation is being discarded here.
+			state.RemoteResetPending = false
+		}
+	}
+
+	state.Count++
+	state.UpdatedAt = now
+
+	var remoteCount int64
+	if s.openAI429CounterCache != nil && !state.RemoteResetPending {
+		count, err := s.openAI429CounterCache.IncrementOpenAI429Count(ctx, accountID, openAIOAuth429ConfirmationWindow)
+		if err != nil {
+			slog.Warn("openai_429_confirmation_cache_failed", "account_id", accountID, "error", err)
+		} else {
+			remoteCount = count
+			if int64(state.Count) < count {
+				state.Count = int(count)
+			}
+		}
+	}
+	if state.Count >= 2 || remoteCount >= 2 {
+		if state.RemoteResetPending {
+			state.Count = 0
+			state.UpdatedAt = time.Time{}
+			s.openAI429Streak.Store(accountID, state)
+		} else {
+			s.openAI429Streak.Delete(accountID)
+		}
+		return true
+	}
+
+	s.openAI429Streak.Store(accountID, state)
+	return false
+}
+
+func (s *RateLimitService) openAI429AccountLock(accountID int64) *sync.Mutex {
+	lock, _ := s.openAI429Locks.LoadOrStore(accountID, &sync.Mutex{})
+	mu, ok := lock.(*sync.Mutex)
+	if !ok {
+		panic("openAI429Locks contains a non-mutex value")
+	}
+	return mu
+}
+
+func (s *RateLimitService) clearOpenAIOAuth429Streak(accountID int64) {
+	s.clearOpenAIOAuth429StreakContext(context.Background(), accountID)
+}
+
+func (s *RateLimitService) clearOpenAIOAuth429StreakContext(ctx context.Context, accountID int64) {
+	if s == nil || accountID <= 0 {
+		return
+	}
+	mu := s.openAI429AccountLock(accountID)
+	mu.Lock()
+	defer mu.Unlock()
+
+	if s.openAI429CounterCache != nil {
+		if err := s.openAI429CounterCache.ResetOpenAI429Count(ctx, accountID); err != nil {
+			slog.Warn("openai_429_confirmation_reset_failed", "account_id", accountID, "error", err)
+			s.openAI429Streak.Store(accountID, openAIOAuth429StreakState{RemoteResetPending: true})
+			return
+		}
+	}
+	s.openAI429Streak.Delete(accountID)
 }
 
 // SetTimeoutCounterCache 设置超时计数器缓存（可选依赖）
@@ -104,6 +199,10 @@ func (s *RateLimitService) SetTimeoutCounterCache(cache TimeoutCounterCache) {
 // SetOpenAI403CounterCache 设置 OpenAI 403 连续失败计数器（可选依赖）
 func (s *RateLimitService) SetOpenAI403CounterCache(cache OpenAI403CounterCache) {
 	s.openAI403CounterCache = cache
+}
+
+func (s *RateLimitService) SetOpenAI429CounterCache(cache OpenAI429CounterCache) {
+	s.openAI429CounterCache = cache
 }
 
 // SetSettingService 设置系统设置服务（可选依赖）
@@ -272,9 +371,21 @@ func (s *RateLimitService) CheckErrorPolicy(ctx context.Context, account *Accoun
 // 返回是否应该停止该账号的调度
 func (s *RateLimitService) HandleUpstreamError(ctx context.Context, account *Account, statusCode int, headers http.Header, responseBody []byte, requestedModel ...string) (shouldDisable bool) {
 	ctx = withTempUnschedulableModel(ctx, requestedModel)
-	// Team 联动熔断必须先于池模式/自定义错误码/临时不可调度的各类早退；
-	// 同请求内与 fastpath 调用点的重复触发由方法内去重吸收。
+	// Team-linked workspace failures must fan out before pool/custom policies
+	// return early; the helper is narrowly gated and short-window deduplicated.
 	s.maybeHandleOpenAITeamLinkedError(ctx, account, statusCode, responseBody)
+	if account.IsOpenAIOAuth() && !account.IsShadow() && account.QuotaDimensionOrDefault() != QuotaDimensionSpark {
+		if statusCode != http.StatusTooManyRequests {
+			s.clearOpenAIOAuth429StreakContext(ctx, account.ID)
+		} else if !openAIOAuth429AlreadyConfirmed(ctx) {
+			persistOpenAI429PlanType(ctx, s.accountRepo, account, responseBody)
+			s.persistOpenAICodexSnapshot(ctx, account, headers)
+			if !s.confirmOpenAIOAuth429Context(ctx, account.ID, time.Now()) {
+				slog.Info("openai_429_confirmation_pending", "account_id", account.ID, "count", 1, "required", 2)
+				return false
+			}
+		}
+	}
 	customErrorCodesEnabled := account.IsCustomErrorCodesEnabled()
 
 	// 池模式默认不标记本地账号状态；但管理员显式配置的临时不可调度规则优先。
@@ -1195,7 +1306,15 @@ func (s *RateLimitService) apply429FallbackRateLimit(ctx context.Context, accoun
 
 	resetAt := time.Now().Add(cooldown)
 	slog.Warn("rate_limit_429_fallback_used", "account_id", account.ID, "platform", account.Platform, "reason", reason, "using_default", cooldown.String())
-	s.notifyAccountSchedulingBlocked(account, resetAt, "429_fallback")
+	// An OAuth 429 reaches this fallback only after the explicit two-signal
+	// confirmation in HandleUpstreamError. Preserve the canonical reason so
+	// the local WebSocket guard can distinguish that confirmed state from
+	// unrelated temporary scheduling blocks and keep its healthy connection.
+	runtimeReason := "429_fallback"
+	if isOpenAIOAuthAccount(account) && account.Codex429GuardEnabled() {
+		runtimeReason = "429"
+	}
+	s.notifyAccountSchedulingBlocked(account, resetAt, runtimeReason)
 	if err := s.accountRepo.SetRateLimited(ctx, account.ID, resetAt); err != nil {
 		slog.Warn("rate_limit_set_failed", "account_id", account.ID, "error", err)
 	}
@@ -1573,7 +1692,14 @@ func pickSooner(a, b *time.Time) *time.Time {
 }
 
 func (s *RateLimitService) persistOpenAICodexSnapshot(ctx context.Context, account *Account, headers http.Header) {
-	if s == nil || s.accountRepo == nil || account == nil || headers == nil {
+	if s == nil {
+		return
+	}
+	persistOpenAICodexSnapshotWithRepo(ctx, s.accountRepo, account, headers)
+}
+
+func persistOpenAICodexSnapshotWithRepo(ctx context.Context, repo AccountRepository, account *Account, headers http.Header) {
+	if repo == nil || account == nil || headers == nil {
 		return
 	}
 	// spark 影子的 codex_* 仅由 QueryUsage(/wham/usage bengalfox 道)更新,不能被 /responses 的
@@ -1589,12 +1715,12 @@ func (s *RateLimitService) persistOpenAICodexSnapshot(ctx context.Context, accou
 	if len(updates) == 0 {
 		return
 	}
-	if err := s.accountRepo.UpdateExtra(ctx, account.ID, updates); err != nil {
+	if err := repo.UpdateExtra(ctx, account.ID, updates); err != nil {
 		slog.Warn("openai_codex_snapshot_persist_failed", "account_id", account.ID, "error", err)
 	}
 }
 
-// parseOpenAIRateLimitResetTime 解析 OpenAI 格式的 429 响应，返回重置时间的 Unix 时间戳
+// parseOpenAIRateLimitResetTime 解析 OpenAI 兼容格式的 429 响应，返回重置时间的 Unix 时间戳
 // OpenAI 的 usage_limit_reached 错误格式：
 //
 //	{
@@ -1616,9 +1742,9 @@ func parseOpenAIRateLimitResetTime(body []byte) *int64 {
 		return nil
 	}
 
-	// 检查是否为 usage_limit_reached 或 rate_limit_exceeded 类型
+	// 检查是否为已知的账号用量限制类型。
 	errType, _ := errObj["type"].(string)
-	if errType != "usage_limit_reached" && errType != "rate_limit_exceeded" {
+	if errType != "usage_limit_reached" && errType != "rate_limit_exceeded" && errType != "GoUsageLimitError" {
 		return nil
 	}
 
@@ -1645,7 +1771,74 @@ func parseOpenAIRateLimitResetTime(body []byte) *int64 {
 		}
 	}
 
+	// OpenCode Go subscriptions expose the reset only in a human-readable message,
+	// for example: "Weekly usage limit reached. Resets in 2 days."
+	if errType == "GoUsageLimitError" {
+		message, _ := errObj["message"].(string)
+		if resetAfter := parseOpenCodeGoUsageLimitResetDuration(message); resetAfter > 0 {
+			ts := time.Now().Add(resetAfter).Unix()
+			return &ts
+		}
+	}
+
 	return nil
+}
+
+func parseOpenCodeGoUsageLimitResetDuration(message string) time.Duration {
+	resetPrefix := openCodeGoUsageLimitResetPattern.FindStringIndex(message)
+	if resetPrefix == nil {
+		return 0
+	}
+
+	remainder := message[resetPrefix[1]:]
+	var total time.Duration
+	for {
+		remainder = strings.TrimSpace(remainder)
+		matches := openCodeGoUsageLimitDurationPartPattern.FindStringSubmatchIndex(remainder)
+		if matches == nil {
+			break
+		}
+
+		value, err := strconv.ParseFloat(remainder[matches[2]:matches[3]], 64)
+		if err != nil || value <= 0 {
+			return 0
+		}
+
+		unit := openCodeGoUsageLimitDurationUnit(remainder[matches[4]:matches[5]])
+		if unit <= 0 {
+			return 0
+		}
+
+		const maxDuration = time.Duration(1<<63 - 1)
+		if value >= float64(maxDuration)/float64(unit) {
+			return 0
+		}
+		part := time.Duration(value * float64(unit))
+		if part <= 0 || total > maxDuration-part {
+			return 0
+		}
+		total += part
+		remainder = remainder[matches[1]:]
+	}
+
+	return total
+}
+
+func openCodeGoUsageLimitDurationUnit(raw string) time.Duration {
+	switch strings.ToLower(raw) {
+	case "s", "sec", "secs", "second", "seconds":
+		return time.Second
+	case "m", "min", "mins", "minute", "minutes":
+		return time.Minute
+	case "h", "hr", "hrs", "hour", "hours":
+		return time.Hour
+	case "d", "day", "days":
+		return 24 * time.Hour
+	case "w", "week", "weeks":
+		return 7 * 24 * time.Hour
+	default:
+		return 0
+	}
 }
 
 func parseOpenAIRateLimitPlanType(body []byte) string {

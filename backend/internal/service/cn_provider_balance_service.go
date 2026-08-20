@@ -141,7 +141,10 @@ func (s *CNProviderBalanceService) queryBalanceForAccount(ctx context.Context, a
 		return nil, infraerrors.New(http.StatusForbidden, "CN_BALANCE_URL_REJECTED", err.Error())
 	}
 	targetURL = validatedURL
-	proxyURL := s.resolveProxyURL(ctx, account)
+	proxyURL, err := resolveConfiguredProxyURLWithLookup(ctx, account, s.proxyRepo)
+	if err != nil {
+		return nil, infraerrors.Newf(http.StatusBadGateway, "CN_BALANCE_PROXY_UNAVAILABLE", "configured account proxy is unavailable: %v", err)
+	}
 	callCtx, cancel := context.WithTimeout(ctx, cnBalanceUpstreamTimeout)
 	defer cancel()
 	req, err := http.NewRequestWithContext(callCtx, http.MethodGet, targetURL, nil)
@@ -259,22 +262,6 @@ func validatePayGAccount(account *Account) error {
 		return infraerrors.New(http.StatusBadRequest, "CN_BALANCE_CODING_PLAN", "coding plan account has no balance endpoint; use quota probe")
 	}
 	return nil
-}
-
-func (s *CNProviderBalanceService) resolveProxyURL(ctx context.Context, account *Account) string {
-	if account == nil || account.ProxyID == nil {
-		return ""
-	}
-	if account.Proxy != nil {
-		return account.Proxy.URL()
-	}
-	if s != nil && s.proxyRepo != nil {
-		if proxy, err := s.proxyRepo.GetByID(ctx, *account.ProxyID); err == nil && proxy != nil {
-			account.Proxy = proxy
-			return proxy.URL()
-		}
-	}
-	return ""
 }
 
 // cnBalanceURL 解析账号的余额端点。

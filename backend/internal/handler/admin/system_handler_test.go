@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	infraerrors "github.com/Wei-Shaw/sub2api/internal/pkg/errors"
+	"github.com/Wei-Shaw/sub2api/internal/pkg/sysutil"
 	"github.com/Wei-Shaw/sub2api/internal/service"
 	"github.com/gin-gonic/gin"
 	"github.com/stretchr/testify/require"
@@ -81,6 +83,7 @@ type systemUpdateResponseEnvelope struct {
 type systemUpdateErrorEnvelope struct {
 	Code    int    `json:"code"`
 	Message string `json:"message"`
+	Reason  string `json:"reason"`
 }
 
 func newSystemHandlerTestRouter(t *testing.T, updateSvc *systemHandlerUpdateServiceStub, repo *memoryIdempotencyRepoStub) *gin.Engine {
@@ -173,6 +176,95 @@ func TestSystemHandlerPerformUpdateFailureStillReturnsInternalError(t *testing.T
 	require.Equal(t, "internal error", body.Message)
 }
 
+func TestSystemHandlerPerformUpdateReturnsActionablePermissionError(t *testing.T) {
+	updateSvc := &systemHandlerUpdateServiceStub{
+		performErr: infraerrors.Conflict(
+			"UPDATE_DIRECTORY_NOT_WRITABLE",
+			"the service user cannot write to the update directory /opt/sub2api; fix its ownership or permissions and retry",
+		),
+	}
+	repo := newMemoryIdempotencyRepoStub()
+	router := newSystemHandlerTestRouter(t, updateSvc, repo)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/system/update", nil)
+	req.Header.Set("Idempotency-Key", "permission-failure")
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Equal(t, 1, updateSvc.performCall)
+
+	var body systemUpdateErrorEnvelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, http.StatusConflict, body.Code)
+	require.Equal(t, "UPDATE_DIRECTORY_NOT_WRITABLE", body.Reason)
+	require.Contains(t, body.Message, "/opt/sub2api")
+	require.Contains(t, body.Message, "fix its ownership or permissions")
+}
+
+func TestSystemHandlerPerformUpdateReturnsStructuredUnsupportedDeploymentError(t *testing.T) {
+	updateSvc := &systemHandlerUpdateServiceStub{
+		performErr: service.ErrInPlaceUpdateUnsupportedContainer,
+	}
+	repo := newMemoryIdempotencyRepoStub()
+	router := newSystemHandlerTestRouter(t, updateSvc, repo)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/system/update", nil)
+	req.Header.Set("Idempotency-Key", "container-update")
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+	require.Equal(t, 1, updateSvc.performCall)
+
+	var body systemUpdateErrorEnvelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, "UPDATE_IN_PLACE_UNSUPPORTED_CONTAINER", body.Reason)
+	require.Contains(t, body.Message, "container deployments")
+}
+
+func TestSystemHandlerPerformUpdateRequiresIdempotencyKeyWhenEnforced(t *testing.T) {
+	updateSvc := &systemHandlerUpdateServiceStub{}
+	repo := newMemoryIdempotencyRepoStub()
+	router := newSystemHandlerTestRouter(t, updateSvc, repo)
+
+	cfg := service.DefaultIdempotencyConfig()
+	cfg.ObserveOnly = false
+	service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, cfg))
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/system/update", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+	require.Zero(t, updateSvc.performCall)
+
+	var body systemUpdateErrorEnvelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, "IDEMPOTENCY_KEY_REQUIRED", body.Reason)
+}
+
+func TestSystemHandlerRestartRejectsUnsupportedPlatform(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	handler := NewSystemHandler(&systemHandlerUpdateServiceStub{}, nil)
+	handler.restartSupportCheck = func() error {
+		return sysutil.ErrRestartUnsupportedPlatform
+	}
+	router := gin.New()
+	router.POST("/api/v1/admin/system/restart", handler.RestartService)
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/admin/system/restart", nil)
+	router.ServeHTTP(rec, req)
+
+	require.Equal(t, http.StatusConflict, rec.Code)
+
+	var body systemUpdateErrorEnvelope
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
+	require.Equal(t, "SYSTEM_RESTART_UNSUPPORTED_PLATFORM", body.Reason)
+	require.Contains(t, body.Message, "supported only on Linux")
+}
+
 // TestSystemHandlerPerformUpdateSurvivesClientDisconnect reproduces #4504:
 // the browser or a reverse proxy (axios 30s default, nginx proxy_read_timeout
 // 60s) aborts the long-running update request and cancels the request
@@ -197,6 +289,40 @@ func TestSystemHandlerPerformUpdateSurvivesClientDisconnect(t *testing.T) {
 	require.True(t, updateSvc.performHasDeadline,
 		"detached update context must still be bounded by a deadline")
 	requireSystemLockStatus(t, repo, service.IdempotencyStatusSucceeded)
+}
+
+func TestSystemOperationsPersistIdempotencyOutcomeAfterClientDisconnect(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		path string
+	}{
+		{name: "update", path: "/api/v1/admin/system/update"},
+		{name: "rollback", path: "/api/v1/admin/system/rollback"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			updateSvc := &systemHandlerUpdateServiceStub{}
+			repo := newMemoryIdempotencyRepoStub()
+			repo.rejectCanceledWrite = true
+			router := newSystemHandlerTestRouter(t, updateSvc, repo)
+
+			cfg := service.DefaultIdempotencyConfig()
+			cfg.ObserveOnly = false
+			service.SetDefaultIdempotencyCoordinator(service.NewIdempotencyCoordinator(repo, cfg))
+
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, tt.path, nil)
+			canceledCtx, cancel := context.WithCancel(context.Background())
+			cancel()
+			req = req.WithContext(canceledCtx)
+			req.Header.Set("Idempotency-Key", "persist-after-disconnect-"+tt.name)
+			router.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusOK, rec.Code)
+			require.NoError(t, repo.markSucceededContextErr,
+				"idempotency completion must not use the canceled client context")
+			requireSystemLockStatus(t, repo, service.IdempotencyStatusSucceeded)
+		})
+	}
 }
 
 func TestSystemHandlerRollbackToVersionSurvivesClientDisconnect(t *testing.T) {

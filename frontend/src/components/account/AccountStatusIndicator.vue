@@ -14,7 +14,15 @@
 
     <!-- Main Status Badge (shown when not rate limited/overloaded) -->
     <template v-else>
-      <div v-if="isTempUnschedulable" class="flex flex-col items-center gap-1">
+      <div v-if="healthProbeFailed" class="group/health relative flex flex-col items-center gap-1">
+        <span class="badge badge-danger text-xs">{{ t('admin.accounts.status.healthDead') }}</span>
+        <div
+          class="invisible absolute left-1/2 top-full z-[100] mt-1.5 w-72 -translate-x-1/2 rounded bg-gray-900 px-3 py-2 text-xs leading-relaxed text-white opacity-0 shadow-xl group-hover/health:visible group-hover/health:opacity-100"
+        >
+          {{ healthProbeReason }}
+        </div>
+      </div>
+      <div v-else-if="isTempUnschedulable" class="flex flex-col items-center gap-1">
         <button
           type="button"
           :class="['badge text-xs', statusClass, 'cursor-pointer']"
@@ -164,6 +172,7 @@ import { useI18n } from 'vue-i18n'
 import Icon from '@/components/icons/Icon.vue'
 import type { Account } from '@/types'
 import { formatCountdown, formatDateTime, formatDateTimeToMinute, formatCountdownWithSuffix, formatTime } from '@/utils/format'
+import { normalizeAccountStatusTranslationKey } from '@/utils/accountStatus'
 
 const { t } = useI18n()
 
@@ -281,6 +290,18 @@ const hasError = computed(() => {
   return props.account.status === 'error'
 })
 
+const healthProbeSnapshot = computed(() => {
+  const extra = props.account.extra as Record<string, unknown> | undefined
+  return extra?.account_health_probe as
+    | { status?: string; reason?: string; attempts?: number; checked_at?: string }
+    | undefined
+})
+
+const healthProbeFailed = computed(() => healthProbeSnapshot.value?.status === 'failed')
+const healthProbeReason = computed(() =>
+  healthProbeSnapshot.value?.reason || t('admin.accounts.status.healthDeadUnknown')
+)
+
 const isQuotaExceeded = computed(() => {
   const exceeded = (used?: number | null, limit?: number | null) =>
     typeof limit === 'number' && limit > 0 && typeof used === 'number' && used >= limit
@@ -315,6 +336,9 @@ const tempUnschedRecoveryText = computed(() => {
 
 // Computed: status badge class
 const statusClass = computed(() => {
+  if (healthProbeFailed.value) {
+    return 'badge-danger'
+  }
   if (hasError.value) {
     return 'badge-danger'
   }
@@ -333,8 +357,17 @@ const statusClass = computed(() => {
   return 'badge-success'
 })
 
+// 已知后端账号状态；其余（含缺失/未知）统一显示 unknown，避免渲染出原始 i18n 键名。
+// active/inactive 由面板写入；disabled/expired 为 domain 常量与历史数据；error 由 SetError 写入。
 // Computed: status text
+const resolveStatusTextByKey = (status: string) => {
+  return t(`admin.accounts.status.${normalizeAccountStatusTranslationKey(status)}`)
+}
+
 const statusText = computed(() => {
+  if (healthProbeFailed.value) {
+    return t('admin.accounts.status.healthDead')
+  }
   if (hasError.value) {
     return t('admin.accounts.status.error')
   }
@@ -342,7 +375,7 @@ const statusText = computed(() => {
     return t('admin.accounts.status.tempUnschedulable')
   }
   if (props.account.status !== 'active') {
-    return t(`admin.accounts.status.${props.account.status}`)
+    return resolveStatusTextByKey(props.account.status || 'unknown')
   }
   if (isQuotaExceeded.value) {
     return t('admin.accounts.status.quotaExceeded')
@@ -350,7 +383,7 @@ const statusText = computed(() => {
   if (!props.account.schedulable) {
     return t('admin.accounts.status.paused')
   }
-  return t(`admin.accounts.status.${props.account.status}`)
+  return t('admin.accounts.status.active')
 })
 
 const handleTempUnschedClick = () => {

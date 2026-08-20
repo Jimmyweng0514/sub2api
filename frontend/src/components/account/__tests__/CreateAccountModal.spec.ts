@@ -124,6 +124,32 @@ const ModelWhitelistSelectorStub = defineComponent({
   template: '<div data-testid="model-whitelist-selector" />',
 })
 
+const SelectStub = defineComponent({
+  name: 'SelectStub',
+  props: {
+    modelValue: {
+      type: [String, Number, Boolean, null],
+      default: ''
+    },
+    options: {
+      type: Array,
+      default: () => []
+    }
+  },
+  emits: ['update:modelValue'],
+  template: `
+    <select
+      v-bind="$attrs"
+      :value="modelValue"
+      @change="$emit('update:modelValue', $event.target.value)"
+    >
+      <option v-for="option in options" :key="option.value" :value="option.value">
+        {{ option.label }}
+      </option>
+    </select>
+  `
+})
+
 function mountModal(groups: any[] = []) {
   return mount(CreateAccountModal, {
     props: { show: true, proxies: [], groups },
@@ -132,7 +158,7 @@ function mountModal(groups: any[] = []) {
         BaseDialog: BaseDialogStub,
         OAuthAuthorizationFlow: OAuthAuthorizationFlowStub,
         ConfirmDialog: true,
-        Select: true,
+        Select: SelectStub,
         Icon: true,
         PlatformIcon: true,
         ProxySelector: true,
@@ -236,6 +262,16 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(createAccountMock.mock.calls[0]?.[0]?.extra?.openai_long_context_billing_enabled).toBe(false)
   })
 
+  it('does not attach OpenAI runtime settings to an Anthropic API key account', async () => {
+    await submitApiKeyAccount('anthropic')
+
+    expect(createAccountMock).toHaveBeenCalledTimes(1)
+    const extra = createAccountMock.mock.calls[0]?.[0]?.extra ?? {}
+    expect(extra).not.toHaveProperty('openai_apikey_responses_websockets_v2_mode')
+    expect(extra).not.toHaveProperty('openai_apikey_responses_websockets_v2_enabled')
+    expect(extra).not.toHaveProperty('openai_long_context_billing_enabled')
+  })
+
   // namespace 摊平是仅 OAuth 的兼容开关：API Key 走 chat completions 回退桥时由桥自行摊平
   it('shows the Codex namespace flatten toggle only for OpenAI OAuth accounts', async () => {
     const wrapper = mountModal()
@@ -248,6 +284,58 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     await selectButtonByText(wrapper, 'API Key')
     expect(wrapper.find('[data-testid="create-openai-flatten-namespaces-toggle"]').exists()).toBe(
       false
+    )
+  })
+
+  it('exposes all opt-in fingerprint modes and persists the selected mode', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+
+    const select = wrapper.get('[data-testid="create-codex-fingerprint-mode-select"]')
+    expect(select.findAll('option').map((option) => option.attributes('value'))).toEqual([
+      'off',
+      'device',
+      'session',
+      'full'
+    ])
+    await select.setValue('full')
+
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex import')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="import-codex-session"]').trigger('click')
+    await flushPromises()
+
+    expect(importCodexSessionMock.mock.calls[0]?.[0]?.extra?.codex_fingerprint_mode).toBe('full')
+  })
+
+  it('shows the profit mode only for OpenAI OAuth and keeps it disabled by default', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+
+    const toggle = wrapper.get('[data-testid="create-codex-429-guard-toggle"]')
+    expect(toggle.attributes('aria-checked')).toBe('false')
+
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex import')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="import-codex-session"]').trigger('click')
+    await flushPromises()
+
+    expect(importCodexSessionMock.mock.calls[0]?.[0]?.extra?.openai_codex_429_guard_enabled).toBe(false)
+  })
+
+  it('keeps profit mode disabled by default and omits it from OpenAI API key accounts', async () => {
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'OpenAI')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('Codex import')
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await wrapper.get('[data-testid="import-codex-session"]').trigger('click')
+    await flushPromises()
+
+    expect(importCodexSessionMock.mock.calls[0]?.[0]?.extra?.openai_codex_429_guard_enabled).toBe(false)
+
+    await submitApiKeyAccount('openai')
+    expect(createAccountMock.mock.calls[0]?.[0]?.extra).not.toHaveProperty(
+      'openai_codex_429_guard_enabled'
     )
   })
 
@@ -393,6 +481,28 @@ describe('CreateAccountModal OpenAI long-context billing', () => {
     expect(payload?.upstream_billing_probe_enabled).toBe(true)
     // 创建成功后前端立即发起一次首探（与其他 apikey 平台一致）。
     expect(probeUpstreamBillingMock).toHaveBeenCalledWith(42)
+  })
+
+  it('requires confirmation and sends proof when enabling Antigravity overages', async () => {
+    const confirmSpy = vi.spyOn(window, 'confirm').mockReturnValue(true)
+    const wrapper = mountModal()
+    await selectButtonByText(wrapper, 'Antigravity')
+    await selectButtonByText(wrapper, 'admin.accounts.types.antigravityApikey')
+    await wrapper.get('form#create-account-form input[type="text"]').setValue('paid relay')
+    const baseInput = wrapper
+      .findAll('input')
+      .find((candidate) => candidate.attributes('placeholder') === 'https://cloudcode-pa.googleapis.com')
+    await baseInput?.setValue('https://relay.example')
+    await wrapper.get('form#create-account-form input[type="password"]').setValue('sk-upstream')
+    await wrapper.get('[data-testid="allow-overages-toggle"]').setValue(true)
+    await wrapper.get('form#create-account-form').trigger('submit.prevent')
+    await flushPromises()
+
+    expect(confirmSpy).toHaveBeenCalledTimes(1)
+    const payload = createAccountMock.mock.calls[0]?.[0]
+    expect(payload?.extra?.allow_overages).toBe(true)
+    expect(payload?.confirm_overages_risk).toBe(true)
+    expect(payload?.proxy_id ?? null).toBeNull()
   })
 
   it('leaves Codex session import billing ownership to the backend', async () => {

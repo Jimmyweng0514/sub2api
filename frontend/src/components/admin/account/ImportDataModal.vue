@@ -52,6 +52,24 @@
       </div>
 
       <div
+        class="flex items-center justify-between gap-4 rounded-lg border border-gray-200 bg-gray-50 px-4 py-3 dark:border-dark-700 dark:bg-dark-800"
+      >
+        <div class="min-w-0">
+          <div class="text-sm font-medium text-gray-800 dark:text-dark-100">
+            {{ t('admin.accounts.codex429Guard') }}
+          </div>
+          <div class="mt-0.5 text-xs text-gray-500 dark:text-dark-400">
+            {{ t('admin.accounts.codex429GuardHint') }}
+          </div>
+        </div>
+        <Toggle
+          :model-value="codex429GuardEnabled"
+          data-test="codex-429-guard-toggle"
+          @update:model-value="(value) => { codex429GuardEnabled = value; codex429GuardOverride = true }"
+        />
+      </div>
+
+      <div
         v-if="result"
         class="space-y-2 rounded-xl border border-gray-200 p-4 dark:border-dark-700"
       >
@@ -99,8 +117,10 @@
 import { computed, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import BaseDialog from '@/components/common/BaseDialog.vue'
+import Toggle from '@/components/common/Toggle.vue'
 import { adminAPI } from '@/api/admin'
 import { useAppStore } from '@/stores/app'
+import { isAntigravityProTier } from '@/utils/antigravityOverages'
 import type { AdminDataImportResult, AdminDataPayload } from '@/types'
 
 interface Props {
@@ -124,6 +144,11 @@ const dragDepth = ref(0)
 const dragActive = computed(() => dragDepth.value > 0)
 const hasCreatedData = ref(false)
 const result = ref<AdminDataImportResult | null>(null)
+const codex429GuardEnabled = ref(false)
+// Omit the override by default so a data import preserves the guard value
+// already present in an exported account. Clicking the toggle opts into an
+// explicit true/false override.
+const codex429GuardOverride = ref(false)
 
 const fileInput = ref<HTMLInputElement | null>(null)
 const selectedFilesLabel = computed(() => {
@@ -143,6 +168,8 @@ watch(
       dragDepth.value = 0
       hasCreatedData.value = false
       result.value = null
+      codex429GuardEnabled.value = false
+      codex429GuardOverride.value = false
       if (fileInput.value) {
         fileInput.value.value = ''
       }
@@ -226,6 +253,21 @@ const readFileAsText = async (sourceFile: File): Promise<string> => {
 
 const SUPPORTED_DATA_TYPES = ['sub2api-data', 'sub2api-bundle']
 const SUPPORTED_DATA_VERSION = 1
+// Keep this in sync with the account-data endpoint's quota platform list. The
+// three OpenAI-compatible CN providers are valid account exports too; rejecting
+// them here would prevent the backend from ever seeing an otherwise valid
+// backup.
+const SUPPORTED_ACCOUNT_PLATFORMS = new Set([
+  'anthropic',
+  'openai',
+  'gemini',
+  'antigravity',
+  'grok',
+  'kimi',
+  'zhipu',
+  'deepseek'
+])
+const SUPPORTED_ACCOUNT_TYPES = new Set(['oauth', 'setup-token', 'apikey', 'upstream', 'bedrock', 'service_account'])
 
 // 与后端 validateDataHeader 对齐:合并前逐文件校验,避免坏文件混入合并 payload 后
 // 报错无法定位来源,或绕过后端本会对单文件做的 type/version 检查。
@@ -246,7 +288,67 @@ const isValidDataPayload = (payload: unknown): payload is AdminDataPayload => {
   ) {
     return false
   }
-  return Array.isArray(candidate.proxies) && Array.isArray(candidate.accounts)
+  if (!Array.isArray(candidate.proxies) || !Array.isArray(candidate.accounts)) return false
+  return candidate.accounts.every((rawAccount) => {
+    if (!rawAccount || typeof rawAccount !== 'object' || Array.isArray(rawAccount)) return false
+    const account = rawAccount as Record<string, unknown>
+    if (!SUPPORTED_ACCOUNT_PLATFORMS.has(account.platform as string)) return false
+    if (!SUPPORTED_ACCOUNT_TYPES.has(account.type as string)) return false
+    if (!account.credentials || typeof account.credentials !== 'object' || Array.isArray(account.credentials)) return false
+    const extra = account.extra
+    if (extra === undefined) return true
+    if (!extra || typeof extra !== 'object' || Array.isArray(extra)) return false
+    const allowOverages = (extra as Record<string, unknown>).allow_overages
+    if (allowOverages !== undefined && typeof allowOverages !== 'boolean') return false
+    if (allowOverages === true && account.platform !== 'antigravity') return false
+    const fingerprintMode = (extra as Record<string, unknown>).codex_fingerprint_mode
+    if (fingerprintMode !== undefined && fingerprintMode !== null) {
+      if (typeof fingerprintMode !== 'string' || !['off', 'device', 'session', 'full'].includes(fingerprintMode.trim().toLowerCase())) return false
+      if (account.platform !== 'openai' || account.type !== 'oauth') return false
+    }
+    const fingerprintSeed = (extra as Record<string, unknown>).codex_fingerprint_seed
+    if (fingerprintSeed !== undefined && fingerprintSeed !== null) {
+      if (typeof fingerprintSeed !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(fingerprintSeed.trim()) || fingerprintSeed.trim().toLowerCase() === '00000000-0000-0000-0000-000000000000') return false
+      if (account.platform !== 'openai' || account.type !== 'oauth') return false
+    }
+    const codex429Guard = (extra as Record<string, unknown>).openai_codex_429_guard_enabled
+    if (codex429Guard !== undefined) {
+      if (typeof codex429Guard !== 'boolean') return false
+      if (account.platform !== 'openai' || account.type !== 'oauth') return false
+    }
+    return true
+  })
+}
+
+// Keep the persisted Codex lifecycle spelling canonical before the payload
+// reaches the backend. Validation accepts legacy case/whitespace for backward
+// compatibility, while account editors and runtime lookups use lowercase
+// values only. UUID seeds are normalized to lowercase as well so a restored
+// export is not needlessly re-minted by the server.
+const normalizeCodexFingerprintModes = (payload: AdminDataPayload): AdminDataPayload => ({
+  ...payload,
+  accounts: payload.accounts.map((account) => {
+    const rawExtra = account.extra
+    if (!rawExtra || typeof rawExtra !== 'object') return account
+
+    const mode = rawExtra.codex_fingerprint_mode
+    const seed = rawExtra.codex_fingerprint_seed
+    if (typeof mode !== 'string' && typeof seed !== 'string') return account
+
+    const extra = { ...rawExtra }
+    if (typeof mode === 'string') {
+      extra.codex_fingerprint_mode = mode.trim().toLowerCase()
+    }
+    if (typeof seed === 'string') {
+      extra.codex_fingerprint_seed = seed.trim().toLowerCase()
+    }
+    return { ...account, extra }
+  })
+})
+
+const importAccountUsesProOverages = (account: AdminDataPayload['accounts'][number]) => {
+  if (account.platform !== 'antigravity' || account.extra?.allow_overages !== true) return false
+  return isAntigravityProTier(account.credentials, account.extra)
 }
 
 const mergeDataPayloads = (payloads: AdminDataPayload[]): AdminDataPayload => {
@@ -291,12 +393,32 @@ const handleImport = async () => {
       }
       dataPayloads.push(parsed)
     }
-    const dataPayload = mergeDataPayloads(dataPayloads)
+    const dataPayload = normalizeCodexFingerprintModes(mergeDataPayloads(dataPayloads))
+    const importsOverages = dataPayload.accounts.some(
+      (account) => account.platform === 'antigravity' && account.extra?.allow_overages === true
+    )
+    const importsProOverages = dataPayload.accounts.some(importAccountUsesProOverages)
+    const overagesWarningKey = importsProOverages
+      ? 'admin.accounts.allowOveragesProConfirm'
+      : 'admin.accounts.allowOveragesImportConfirm'
+    if (importsOverages && !window.confirm(t(overagesWarningKey))) {
+      return
+    }
 
-    const res = await adminAPI.accounts.importData({
+    const importPayload: {
+      data: AdminDataPayload
+      skip_default_group_bind: boolean
+      codex_429_guard_enabled?: boolean
+      confirm_overages_risk: boolean
+    } = {
       data: dataPayload,
-      skip_default_group_bind: true
-    })
+      skip_default_group_bind: true,
+      confirm_overages_risk: importsOverages
+    }
+    if (codex429GuardOverride.value) {
+      importPayload.codex_429_guard_enabled = codex429GuardEnabled.value
+    }
+    const res = await adminAPI.accounts.importData(importPayload)
 
     result.value = res
 

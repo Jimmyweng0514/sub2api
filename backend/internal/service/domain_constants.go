@@ -596,17 +596,20 @@ const (
 	SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled = "openai_advanced_scheduler_sticky_weighted_enabled"
 	// SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled OpenAI 高级调度下是否优先使用订阅账号池。
 	SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled = "openai_advanced_scheduler_subscription_priority_enabled"
-	SettingKeyOpenAIAdvancedSchedulerLBTopK                      = "openai_advanced_scheduler_lb_top_k"
-	SettingKeyOpenAIAdvancedSchedulerWeightPriority              = "openai_advanced_scheduler_weight_priority"
-	SettingKeyOpenAIAdvancedSchedulerWeightLoad                  = "openai_advanced_scheduler_weight_load"
-	SettingKeyOpenAIAdvancedSchedulerWeightQueue                 = "openai_advanced_scheduler_weight_queue"
-	SettingKeyOpenAIAdvancedSchedulerWeightErrorRate             = "openai_advanced_scheduler_weight_error_rate"
-	SettingKeyOpenAIAdvancedSchedulerWeightTTFT                  = "openai_advanced_scheduler_weight_ttft"
-	SettingKeyOpenAIAdvancedSchedulerWeightReset                 = "openai_advanced_scheduler_weight_reset"
-	SettingKeyOpenAIAdvancedSchedulerWeightQuotaHeadroom         = "openai_advanced_scheduler_weight_quota_headroom"
-	SettingKeyOpenAIAdvancedSchedulerWeightUpstreamCost          = "openai_advanced_scheduler_weight_upstream_cost"
-	SettingKeyOpenAIAdvancedSchedulerWeightPreviousResponse      = "openai_advanced_scheduler_weight_previous_response"
-	SettingKeyOpenAIAdvancedSchedulerWeightSessionSticky         = "openai_advanced_scheduler_weight_session_sticky"
+	// SettingKeyOpenAIStickySessionIdleTTLSeconds 粘性会话空闲租约（秒）：
+	// 会话在该窗口内没有新请求即释放账号绑定；默认 60，可按负载调低（如 10）。
+	SettingKeyOpenAIStickySessionIdleTTLSeconds             = "openai_sticky_session_idle_ttl_seconds"
+	SettingKeyOpenAIAdvancedSchedulerLBTopK                 = "openai_advanced_scheduler_lb_top_k"
+	SettingKeyOpenAIAdvancedSchedulerWeightPriority         = "openai_advanced_scheduler_weight_priority"
+	SettingKeyOpenAIAdvancedSchedulerWeightLoad             = "openai_advanced_scheduler_weight_load"
+	SettingKeyOpenAIAdvancedSchedulerWeightQueue            = "openai_advanced_scheduler_weight_queue"
+	SettingKeyOpenAIAdvancedSchedulerWeightErrorRate        = "openai_advanced_scheduler_weight_error_rate"
+	SettingKeyOpenAIAdvancedSchedulerWeightTTFT             = "openai_advanced_scheduler_weight_ttft"
+	SettingKeyOpenAIAdvancedSchedulerWeightReset            = "openai_advanced_scheduler_weight_reset"
+	SettingKeyOpenAIAdvancedSchedulerWeightQuotaHeadroom    = "openai_advanced_scheduler_weight_quota_headroom"
+	SettingKeyOpenAIAdvancedSchedulerWeightUpstreamCost     = "openai_advanced_scheduler_weight_upstream_cost"
+	SettingKeyOpenAIAdvancedSchedulerWeightPreviousResponse = "openai_advanced_scheduler_weight_previous_response"
+	SettingKeyOpenAIAdvancedSchedulerWeightSessionSticky    = "openai_advanced_scheduler_weight_session_sticky"
 
 	// SettingKeyBackendModeEnabled Backend 模式：禁用用户注册和自助服务，仅管理员可登录
 	SettingKeyBackendModeEnabled = "backend_mode_enabled"
@@ -639,19 +642,19 @@ const (
 	SettingKeyRewriteMessageCacheControl = "rewrite_message_cache_control"
 	// SettingKeyAntigravityUserAgentVersion Antigravity 上游 User-Agent 版本号（空值使用环境变量/默认值）
 	SettingKeyAntigravityUserAgentVersion = "antigravity_user_agent_version"
-	// SettingKeyOpenAICodexUserAgent OpenAI Codex 完整 User-Agent（空值使用内置默认）
-	// 当客户端 UA 被识别为浏览器（Chrome/Firefox/Safari/Edge 等）时，转发给 OpenAI 上游前会替换为此值，
-	// 用于避免 Cloudflare 对浏览器型 UA 的质询拦截。
+	// SettingKeyOpenAICodexUserAgent is a deprecated legacy administrative value.
+	// It remains parseable and storable for migration, but never replaces an
+	// inbound User-Agent on OpenAI/Codex upstream requests.
 	SettingKeyOpenAICodexUserAgent = "openai_codex_user_agent"
-	// SettingKeyOpenAICodexClientVersion 网关对 ChatGPT 上游声明的 Codex 客户端版本号（管理员覆写）。
-	// 空值表示跟随自动同步值；自动同步也没有结果时回退到内置常量。
-	// 上游在容量紧张时按客户端身份分优先级降载，陈旧版本会被优先丢弃，故该值需保持跟随官方发布。
+	// SettingKeyOpenAICodexClientVersion is a deprecated legacy administrative value.
+	// It remains parseable and storable for migration, but never replaces an
+	// inbound version on OpenAI/Codex upstream requests.
 	SettingKeyOpenAICodexClientVersion = "openai_codex_client_version"
-	// SettingKeyOpenAICodexClientVersionSynced 自动同步任务写入的官方 Codex 最新稳定版版本号。
-	// 由 OpenAICodexVersionSyncService 独占写入，面板只读展示；管理员覆写请用
-	// SettingKeyOpenAICodexClientVersion。
+	// SettingKeyOpenAICodexClientVersionSynced is the legacy auto-sync display value.
+	// New deployments do not start this sync because it has no transport effect.
 	SettingKeyOpenAICodexClientVersionSynced = "openai_codex_client_version_synced"
-	// SettingKeyOpenAICodexVersionAutoSyncEnabled 是否启用 Codex 客户端版本号自动同步（默认 true）。
+	// SettingKeyOpenAICodexVersionAutoSyncEnabled controls only the retained legacy
+	// sync service; it has no effect on outbound request identity.
 	SettingKeyOpenAICodexVersionAutoSyncEnabled = "openai_codex_version_auto_sync_enabled"
 	// SettingKeyOpenAIAllowClaudeCodeCodexPlugin 已废弃：历史全局开关只作为升级迁移输入读取。
 	// 迁移后等价规则写入 SettingKeyCodexCLIOnlyWhitelist，不再参与运行时判定。

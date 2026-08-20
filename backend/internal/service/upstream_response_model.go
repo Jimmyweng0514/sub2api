@@ -175,7 +175,6 @@ func upstreamModelsMatchForAudit(sentModel, responseModel string) bool {
 	if strings.EqualFold(sentModel, responseModel) {
 		return true
 	}
-
 	// xAI reports the runtime build ID for these supported public aliases.
 	// Canonicalize only for mismatch auditing; keep the raw response model for
 	// observability and for the separate response-model billing safeguards.

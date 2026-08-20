@@ -76,24 +76,25 @@ func SetCodexCanonicalUserAgentResolver(resolver func() string) {
 	codexCanonicalUAResolver = resolver
 }
 
-// CodexCanonicalUserAgent 返回当前生效的规范 Codex User-Agent。
-// 取值走与推理相同的解析链：面板 UA 指纹 + 面板/自动同步版本号 + 编译期兜底。
-// 供无账号句柄的出站路径（OAuth 换 Token / 刷新）使用。
+// CodexCanonicalUserAgent returns the effective canonical Codex User-Agent.
+// Paths without an account handle (OAuth credential exchange and refresh)
+// use the same resolver as inference so the credential and inference faces
+// cannot drift to different client versions.
 func CodexCanonicalUserAgent() string {
 	return resolveCodexOutboundIdentity("").userAgent
 }
 
-// CodexCanonicalAuthIdentity 返回凭据面（auth.openai.com：换 Token / 刷新 / whoami）
-// 出站请求的身份对：规范 User-Agent 与配套 originator，与推理解析链同源。
-// 凭据面不发 version 头——真实 Codex 客户端在该面只携带 originator 与 User-Agent
-// （codex-rs login/default_client.rs 的 default_headers()），version 门槛
-// （issue #3901）只存在于 /backend-api/codex 推理面。
+// CodexCanonicalAuthIdentity returns the identity pair used by the Codex
+// credential face (auth.openai.com). The real client sends originator and
+// User-Agent there, but does not send the inference-only version header.
 func CodexCanonicalAuthIdentity() (userAgent, originator string) {
 	identity := resolveCodexOutboundIdentity("")
 	return identity.userAgent, identity.originator
 }
 
-// ApplyCodexCanonicalAuthIdentity 为凭据面出站请求写入身份对（不含 version）。
+// ApplyCodexCanonicalAuthIdentity applies the credential-face identity pair.
+// It deliberately omits the version header; version gating belongs to the
+// /backend-api/codex inference endpoint only.
 func ApplyCodexCanonicalAuthIdentity(h http.Header) {
 	if h == nil {
 		return
@@ -103,7 +104,8 @@ func ApplyCodexCanonicalAuthIdentity(h http.Header) {
 	h.Set("originator", originator)
 }
 
-// CodexCanonicalClientVersion 返回当前生效的 Codex 客户端版本号。
+// CodexCanonicalClientVersion returns the effective canonical inference
+// version, sourced from the same resolver as CodexCanonicalUserAgent.
 func CodexCanonicalClientVersion() string {
 	return resolveCodexOutboundIdentity("").version
 }
@@ -187,7 +189,11 @@ func ensureCodexIdentityHeaders(h http.Header) {
 	h.Set("OpenAI-Beta", "responses=experimental")
 }
 
-// applyOpenAICodexProbeHeaders 为合成探测请求补齐 Codex 身份和引擎指纹。
+// applyOpenAICodexProbeHeaders gives synthetic probes the stable protocol
+// headers required by the Codex endpoint. It intentionally does not add a
+// lone window/device marker: those fields are projections of the official
+// client's complete installation/session/thread snapshot and a probe has no
+// client-owned snapshot to forward.
 func applyOpenAICodexProbeHeaders(h http.Header) {
 	if h == nil {
 		return
@@ -233,6 +239,9 @@ func enforceCodexIdentityHeadersWithUA(h http.Header, overrideUA string) {
 // pairCodexIdentityHeaders 是关闭强制统一后的兜底收口：保留客户端真实身份，
 // 仅保证 originator 与最终 User-Agent 首段配套、version 不低于上游门槛（issue #3901）。
 func pairCodexIdentityHeaders(h http.Header) {
+	if h == nil {
+		return
+	}
 	originator, pairedUA, ok := openai.PairCodexClientIdentity(h.Get("user-agent"))
 	if !ok {
 		identity := resolveCodexOutboundIdentity("")

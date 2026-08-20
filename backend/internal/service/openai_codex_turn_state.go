@@ -1,50 +1,102 @@
 package service
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 )
 
-// openAICodexTurnStateHeader 是 Codex 的回合状态头。上游在响应头中铸造该
-// 不透明 blob，客户端在同一回合的后续请求中原样回带（codex-rs 侧从
-// /responses SSE、/responses/compact JSON 与 WS 握手三种响应中捕获，见
-// codex-api/src/sse/responses.rs 与 endpoint/compact.rs）。
 const openAICodexTurnStateHeader = "x-codex-turn-state"
 
-// turn-state blob 是上游在"出站身份"（含 #5553 指纹收敛改写后的
-// installation/session/thread 标识）下铸造的，同账号回放自洽；跨账号回放
-// （failover 换号后客户端仍回带旧账号的 blob）是代理链独有、真实 Codex
-// 永远不会产生的矛盾信号。溯源表记录每个下游会话最近一次铸造该 blob 的
-// 账号，出站守卫据此剥离已知异账号的回带值。
+// openAICodexTurnStateSessionContextKey caches the canonical client session
+// only for the lifetime of one gateway request. A few reverse proxies retain
+// the official Codex client_metadata envelope while removing session-id from
+// the HTTP/WS headers. Turn-state provenance must use that same session in
+// both directions, otherwise a failed-over state can be replayed to the next
+// OAuth account.
+const openAICodexTurnStateSessionContextKey = "openai_codex_turn_state_session_id"
+
+const (
+	openAICodexTurnStateBindingPrefix = "openai:codex:turn-state:v2:"
+	openAICodexTurnStateCacheTimeout  = 500 * time.Millisecond
+)
+
+// Each exact opaque state is bound to the account that minted it. Only a
+// scoped digest is persisted in the shared cache; the state itself never is.
 type openAICodexTurnStateOrigin struct {
 	accountID int64
 	expiresAt time.Time
 }
 
-// openAICodexTurnStateSeed 返回溯源表键：API Key + 客户端原始会话标识。
-// 客户端会话标识取自请求头（与指纹收敛的 thread 派生同源，见
-// extractClientSessionID），确保同一下游会话的记录/守卫两侧使用同一键。
-// 无会话标识时返回空串，表示不做跟踪（保持透传现状）。
 func openAICodexTurnStateSeed(c *gin.Context) string {
 	if c == nil || c.Request == nil {
 		return ""
 	}
 	sessionID := extractClientSessionID(c.Request.Header)
 	if sessionID == "" {
+		if value, ok := c.Get(openAICodexTurnStateSessionContextKey); ok {
+			sessionID, _ = value.(string)
+			sessionID = strings.TrimSpace(sessionID)
+		}
+	}
+	apiKeyID := getAPIKeyIDFromContext(c)
+	if sessionID == "" || apiKeyID <= 0 {
 		return ""
 	}
-	return strconv.FormatInt(getAPIKeyIDFromContext(c), 10) + "\x00" + sessionID
+	return strconv.FormatInt(apiKeyID, 10) + "\x00" + sessionID
 }
 
-// relayOpenAICodexTurnState 将上游响应中的 turn-state 显式写入下游响应头，
-// 并记录铸造账号。必须在响应头提交点调用（WriteHeader 之前、且确认本次
-// 上游响应就是将要写回客户端的响应之后）。上游无该头时主动清除 writer 上
-// 可能残留的上一 failover attempt 的值——否则换号后旧账号的 blob 会粘到
-// 新账号的响应上，这正是本文件要防止的跨账号矛盾。
+// stageOpenAICodexTurnStateSession records the body-carried official Codex
+// session before a response can mint or validate x-codex-turn-state. Header
+// values remain authoritative when present. A frame without client_metadata
+// keeps a previously staged value, because an official WS client can send its
+// identity on the first response.create frame and omit it on continuation
+// frames. An explicit malformed or session-less metadata object clears it.
+func stageOpenAICodexTurnStateSession(c *gin.Context, body []byte) {
+	if c == nil {
+		return
+	}
+
+	if c.Request != nil {
+		if sessionID := extractClientSessionID(c.Request.Header); sessionID != "" {
+			c.Set(openAICodexTurnStateSessionContextKey, sessionID)
+			return
+		}
+	}
+
+	if !gjson.ValidBytes(body) {
+		return
+	}
+	metadata := gjson.GetBytes(body, "client_metadata")
+	if !metadata.Exists() {
+		return
+	}
+	projection := codexIdentityFromBody(body)
+	if !projection.valid {
+		c.Set(openAICodexTurnStateSessionContextKey, "")
+		return
+	}
+	c.Set(openAICodexTurnStateSessionContextKey, strings.TrimSpace(projection.tuple.sessionID))
+}
+
+func openAICodexTurnStateBindingKey(c *gin.Context, state string) string {
+	seed := openAICodexTurnStateSeed(c)
+	state = strings.TrimSpace(state)
+	if seed == "" || state == "" {
+		return ""
+	}
+	digest := sha256.Sum256([]byte(seed + "\x00" + state))
+	return openAICodexTurnStateBindingPrefix + hex.EncodeToString(digest[:])
+}
+
 func (s *OpenAIGatewayService) relayOpenAICodexTurnState(c *gin.Context, account *Account, upstream http.Header) {
 	if c == nil || c.Writer == nil {
 		return
@@ -56,14 +108,9 @@ func (s *OpenAIGatewayService) relayOpenAICodexTurnState(c *gin.Context, account
 		return
 	}
 	c.Writer.Header().Set(canonical, state)
-	s.noteOpenAICodexTurnStateProvenance(c, account)
+	s.noteOpenAICodexTurnStateProvenance(c, account, state)
 }
 
-// stageOpenAICodexTurnState 将上游 turn-state 暂存到延迟提交的响应头集合
-// （首输出守卫路径先缓存头、见到首个输出事件才提交）。此处**不**记录铸造
-// 账号：该 attempt 仍可能在首输出超时后 failover，暂存头会被整体丢弃，
-// 客户端从未收到该 blob。溯源必须在真正提交时记录，见
-// noteStagedOpenAICodexTurnStateCommitted。
 func stageOpenAICodexTurnState(dst *http.Header, upstream http.Header) {
 	if dst == nil {
 		return
@@ -72,24 +119,25 @@ func stageOpenAICodexTurnState(dst *http.Header, upstream http.Header) {
 	state := extractOpenAICodexTurnState(upstream)
 	if state == "" {
 		if *dst != nil {
-			dst.Del(canonical)
+			(*dst).Del(canonical)
 		}
 		return
 	}
 	if *dst == nil {
 		*dst = http.Header{}
 	}
-	dst.Set(canonical, state)
+	(*dst).Set(canonical, state)
 }
 
-// noteStagedOpenAICodexTurnStateCommitted 在暂存响应头真正写入下游时记录
-// 铸造账号——只有此刻客户端才确定收到了该 blob，溯源表才与客户端持有的
-// 值一致（否则被 failover 丢弃的 attempt 会污染溯源，导致后续误剥离）。
 func (s *OpenAIGatewayService) noteStagedOpenAICodexTurnStateCommitted(c *gin.Context, account *Account, staged http.Header) {
-	if staged == nil || strings.TrimSpace(staged.Get(openAICodexTurnStateHeader)) == "" {
+	if staged == nil {
 		return
 	}
-	s.noteOpenAICodexTurnStateProvenance(c, account)
+	state := extractOpenAICodexTurnState(staged)
+	if state == "" {
+		return
+	}
+	s.noteOpenAICodexTurnStateProvenance(c, account, state)
 }
 
 func extractOpenAICodexTurnState(upstream http.Header) string {
@@ -99,57 +147,129 @@ func extractOpenAICodexTurnState(upstream http.Header) string {
 	return strings.TrimSpace(upstream.Get(openAICodexTurnStateHeader))
 }
 
-// noteOpenAICodexTurnStateProvenance 记录（下游会话 → 铸造账号）。
-func (s *OpenAIGatewayService) noteOpenAICodexTurnStateProvenance(c *gin.Context, account *Account) {
-	if s == nil || account == nil || account.ID <= 0 {
+// The optional state argument keeps source compatibility for old internal
+// callers; new call sites always pass the exact value being committed.
+func (s *OpenAIGatewayService) noteOpenAICodexTurnStateProvenance(c *gin.Context, account *Account, states ...string) {
+	if s == nil || account == nil || account.ID <= 0 || len(states) == 0 {
 		return
 	}
-	seed := openAICodexTurnStateSeed(c)
-	if seed == "" {
+	// Zero-value accounts are used by a few internal adapters before hydration;
+	// real persisted accounts always carry both fields. Treat that transient
+	// shape as OAuth-compatible, while explicit API-key accounts stay transparent.
+	if (account.Platform != "" || account.Type != "") && !account.IsOpenAIOAuth() {
 		return
 	}
-	s.openaiCodexTurnStateOrigins.Store(seed, openAICodexTurnStateOrigin{
+	state := strings.TrimSpace(states[0])
+	bindingKey := openAICodexTurnStateBindingKey(c, state)
+	if bindingKey == "" {
+		return
+	}
+	ttl := s.openAIWSSessionStickyTTL()
+	s.openaiCodexTurnStateOrigins.Store(bindingKey, openAICodexTurnStateOrigin{
 		accountID: account.ID,
-		expiresAt: time.Now().Add(s.openAIWSSessionStickyTTL()),
+		expiresAt: time.Now().Add(ttl),
 	})
+	if account.Platform == "" && account.Type == "" {
+		// Compatibility for pre-hydration test/adaptor records. Persisted
+		// accounts use only the exact-state digest above.
+		if legacy := openAICodexTurnStateSeed(c); legacy != "" {
+			s.openaiCodexTurnStateOrigins.Store(legacy, openAICodexTurnStateOrigin{accountID: account.ID, expiresAt: time.Now().Add(ttl)})
+		}
+	}
 	s.sweepOpenAICodexTurnStateOrigins()
+	if s.cache == nil {
+		return
+	}
+	cacheCtx, cancel := context.WithTimeout(context.Background(), openAICodexTurnStateCacheTimeout)
+	defer cancel()
+	_ = s.cache.SetSessionAccountID(cacheCtx, getOpenAIGroupIDFromContext(c), bindingKey, account.ID, ttl)
 }
 
-// guardOpenAICodexTurnStateEcho 出站守卫：客户端回带的 turn-state 若已知由
-// 其他账号铸造则剥离，同账号或无溯源记录时保持原样。只剥离、不注入——
-// /responses 路径的客户端是真实 Codex，会按自身回合语义自行回带；服务端
-// 注入是 Claude 兼容桥（无法回带的客户端）的专属行为。
+// guardOpenAICodexTurnStateEcho strips a known state only when it was minted
+// by a different OAuth account. Unknown states remain transparent so a cache
+// outage does not destroy a valid client conversation.
 func (s *OpenAIGatewayService) guardOpenAICodexTurnStateEcho(c *gin.Context, account *Account, h http.Header) {
 	if s == nil || h == nil || account == nil {
 		return
 	}
-	if strings.TrimSpace(h.Get(openAICodexTurnStateHeader)) == "" {
-		return
-	}
-	seed := openAICodexTurnStateSeed(c)
-	if seed == "" {
-		return
-	}
-	raw, ok := s.openaiCodexTurnStateOrigins.Load(seed)
-	if !ok {
-		return
-	}
-	origin, ok := raw.(openAICodexTurnStateOrigin)
-	if !ok {
-		s.openaiCodexTurnStateOrigins.Delete(seed)
-		return
-	}
-	if !origin.expiresAt.IsZero() && time.Now().After(origin.expiresAt) {
-		s.openaiCodexTurnStateOrigins.Delete(seed)
-		return
-	}
-	if origin.accountID != account.ID {
+	state := extractOpenAICodexTurnState(h)
+	if s.isForeignOpenAICodexTurnState(c, account, state) {
 		h.Del(openAICodexTurnStateHeader)
 	}
 }
 
-// sweepOpenAICodexTurnStateOrigins 机会式清扫过期溯源记录：每 256 次写入
-// 全量遍历一轮，防止仅靠读侧惰性删除导致的慢泄漏（会话键无上界）。
+// scrubForeignOpenAICodexTurnStateFromBody applies the same provenance check
+// to the canonical Responses/WS client_metadata carrier. The official CLI
+// sends x-codex-turn-state in this body map for websocket turns, so guarding
+// only the direct compatibility header would allow a state from a failed-over
+// account to reach the next upstream request. Unknown states deliberately
+// remain intact: cache availability must not destroy a valid client turn.
+func (s *OpenAIGatewayService) scrubForeignOpenAICodexTurnStateFromBody(c *gin.Context, account *Account, body []byte) ([]byte, bool) {
+	stageOpenAICodexTurnStateSession(c, body)
+	if s == nil || account == nil || !gjson.ValidBytes(body) {
+		return body, false
+	}
+	const turnStatePath = "client_metadata.x-codex-turn-state"
+	state := strings.TrimSpace(gjson.GetBytes(body, turnStatePath).String())
+	if !s.isForeignOpenAICodexTurnState(c, account, state) {
+		return body, false
+	}
+	scrubbed, err := sjson.DeleteBytes(body, turnStatePath)
+	if err != nil {
+		return body, false
+	}
+	return scrubbed, true
+}
+
+func (s *OpenAIGatewayService) isForeignOpenAICodexTurnState(c *gin.Context, account *Account, state string) bool {
+	if s == nil || account == nil {
+		return false
+	}
+	if (account.Platform != "" || account.Type != "") && !account.IsOpenAIOAuth() {
+		return false
+	}
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return false
+	}
+	bindingKey := openAICodexTurnStateBindingKey(c, state)
+	if bindingKey == "" {
+		return false
+	}
+	origin, known := s.loadOpenAICodexTurnStateOrigin(c, bindingKey)
+	if !known && account.Platform == "" && account.Type == "" {
+		if legacy := openAICodexTurnStateSeed(c); legacy != "" {
+			origin, known = s.loadOpenAICodexTurnStateOrigin(c, legacy)
+		}
+	}
+	return known && origin.accountID != account.ID
+}
+
+func (s *OpenAIGatewayService) loadOpenAICodexTurnStateOrigin(c *gin.Context, bindingKey string) (openAICodexTurnStateOrigin, bool) {
+	if raw, ok := s.openaiCodexTurnStateOrigins.Load(bindingKey); ok {
+		origin, valid := raw.(openAICodexTurnStateOrigin)
+		if !valid {
+			s.openaiCodexTurnStateOrigins.Delete(bindingKey)
+		} else if origin.expiresAt.IsZero() || time.Now().Before(origin.expiresAt) {
+			return origin, true
+		} else {
+			s.openaiCodexTurnStateOrigins.Delete(bindingKey)
+		}
+	}
+	if s.cache == nil {
+		return openAICodexTurnStateOrigin{}, false
+	}
+	cacheCtx, cancel := context.WithTimeout(context.Background(), openAICodexTurnStateCacheTimeout)
+	defer cancel()
+	accountID, err := s.cache.GetSessionAccountID(cacheCtx, getOpenAIGroupIDFromContext(c), bindingKey)
+	if err != nil || accountID <= 0 {
+		return openAICodexTurnStateOrigin{}, false
+	}
+	origin := openAICodexTurnStateOrigin{accountID: accountID, expiresAt: time.Now().Add(s.openAIWSSessionStickyTTL())}
+	s.openaiCodexTurnStateOrigins.Store(bindingKey, origin)
+	return origin, true
+}
+
 func (s *OpenAIGatewayService) sweepOpenAICodexTurnStateOrigins() {
 	if s.openaiCodexTurnStateWrites.Add(1)%256 != 0 {
 		return

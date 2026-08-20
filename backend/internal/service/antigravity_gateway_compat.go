@@ -284,6 +284,9 @@ func (s *AntigravityGatewayService) buildAntigravityCompatGeminiBody(
 	return antigravity.TransformClaudeToGeminiWithOptions(claudeRequest, projectID, mappedModel, options)
 }
 
+// enableMixedGeminiToolInvocations preserves the server-side invocation flag
+// required by newer Gemini models when built-in Google Search and client
+// function declarations are used together.
 func enableMixedGeminiToolInvocations(body []byte) ([]byte, error) {
 	var request map[string]any
 	if err := json.Unmarshal(body, &request); err != nil {

@@ -369,6 +369,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			credentials = mergeMap(existing.Credentials, credentials)
 		}
 		reconcileCRSUpstreamBillingProbeExtra(existing, PlatformAnthropic, targetType, credentials, extra)
+		scrubCRSOpenAIOAuthOnlyExtra(PlatformAnthropic, targetType, extra)
 
 		if existing == nil {
 			if !shouldCreateAccount(src.ID, selectedSet) {
@@ -505,6 +506,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			credentials = mergeMap(existing.Credentials, credentials)
 		}
 		reconcileCRSUpstreamBillingProbeExtra(existing, PlatformAnthropic, AccountTypeAPIKey, credentials, extra)
+		scrubCRSOpenAIOAuthOnlyExtra(PlatformAnthropic, AccountTypeAPIKey, extra)
 
 		if existing == nil {
 			if !shouldCreateAccount(src.ID, selectedSet) {
@@ -660,6 +662,8 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			credentials = mergeMap(existing.Credentials, credentials)
 		}
 		reconcileCRSUpstreamBillingProbeExtra(existing, PlatformOpenAI, AccountTypeOAuth, credentials, extra)
+		extra = normalizeCRSOpenAICodexFingerprintExtra(existing, extra)
+		scrubCRSOpenAIOAuthOnlyExtra(PlatformOpenAI, AccountTypeOAuth, extra)
 
 		if existing == nil {
 			if !shouldCreateAccount(src.ID, selectedSet) {
@@ -811,6 +815,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			credentials = mergeMap(existing.Credentials, credentials)
 		}
 		reconcileCRSUpstreamBillingProbeExtra(existing, PlatformOpenAI, AccountTypeAPIKey, credentials, extra)
+		scrubCRSOpenAIOAuthOnlyExtra(PlatformOpenAI, AccountTypeAPIKey, extra)
 
 		if existing == nil {
 			if !shouldCreateAccount(src.ID, selectedSet) {
@@ -941,6 +946,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			credentials = mergeMap(existing.Credentials, credentials)
 		}
 		reconcileCRSUpstreamBillingProbeExtra(existing, PlatformGemini, AccountTypeOAuth, credentials, extra)
+		scrubCRSOpenAIOAuthOnlyExtra(PlatformGemini, AccountTypeOAuth, extra)
 
 		if existing == nil {
 			if !shouldCreateAccount(src.ID, selectedSet) {
@@ -1071,6 +1077,7 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 			credentials = mergeMap(existing.Credentials, credentials)
 		}
 		reconcileCRSUpstreamBillingProbeExtra(existing, PlatformGemini, AccountTypeAPIKey, credentials, extra)
+		scrubCRSOpenAIOAuthOnlyExtra(PlatformGemini, AccountTypeAPIKey, extra)
 
 		if existing == nil {
 			if !shouldCreateAccount(src.ID, selectedSet) {
@@ -1141,6 +1148,62 @@ func (s *CRSSyncService) SyncFromCRS(ctx context.Context, input SyncFromCRSInput
 	}
 
 	return result, nil
+}
+
+// normalizeCRSOpenAICodexFingerprintExtra keeps CRS synchronization aligned
+// with the normal account lifecycle. CRS payloads never own the official
+// Codex client's installation/session lifecycle: an incoming seed is always
+// discarded, while an existing local seed is preserved and a new seed is
+// generated only for an explicit convergence mode.
+func normalizeCRSOpenAICodexFingerprintExtra(existing *Account, extra map[string]any) map[string]any {
+	extra = RetireCodexFingerprintExtra(extra)
+	if extra == nil {
+		extra = make(map[string]any)
+	} else {
+		cloned := make(map[string]any, len(extra))
+		for key, value := range extra {
+			cloned[key] = value
+		}
+		extra = cloned
+	}
+	// CRS is a synchronization source, not a backup of account-owned identity.
+	// Never allow a remote payload to rotate or choose the persisted seed.
+	delete(extra, codexFingerprintSeedExtraKey)
+	if existing != nil && existing.IsCredentialShadow() {
+		// Shadows do not own an OAuth installation. CRS can still carry legacy
+		// identity fields in its merged payload, so remove them even though the
+		// target branch remains OpenAI/OAuth.
+		scrubCRSCodexIdentityExtra(extra)
+		return extra
+	}
+	if existing != nil {
+		return NormalizeCodexFingerprintExtraForExistingAccount(existing, extra)
+	}
+	return NormalizeCodexFingerprintExtraForAccount(PlatformOpenAI, AccountTypeOAuth, extra)
+}
+
+// scrubCRSOpenAIOAuthOnlyExtra mirrors the admin account type-transition
+// guard for the direct CRS synchronization path. CRS updates intentionally
+// write through AccountRepository (they are not routed through UpdateAccount),
+// so an OAuth -> API-key/setup-token/platform conversion must explicitly drop
+// the old installation identity and 429 guard fields here as well.
+func scrubCRSOpenAIOAuthOnlyExtra(platform, accountType string, extra map[string]any) {
+	if platform == PlatformOpenAI && accountType == AccountTypeOAuth {
+		return
+	}
+	scrubCRSCodexIdentityExtra(extra)
+}
+
+func scrubCRSCodexIdentityExtra(extra map[string]any) {
+	for _, key := range []string{
+		codexFingerprintModeExtraKey,
+		codexFingerprintSeedExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+		OpenAICodex429GuardEnabledExtraKey,
+	} {
+		delete(extra, key)
+	}
 }
 
 func mergeMap(existing map[string]any, updates map[string]any) map[string]any {

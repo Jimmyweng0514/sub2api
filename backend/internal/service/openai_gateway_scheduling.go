@@ -152,7 +152,10 @@ func (s *OpenAIGatewayService) GenerateSessionHash(c *gin.Context, body []byte) 
 
 	sessionID := explicitOpenAIRequestSessionID(c, body)
 	if sessionID == "" && len(body) > 0 {
-		sessionID = deriveOpenAIContentSessionSeed(body)
+		// Content affinity is useful only with a meaningful user/input anchor.
+		// A model-only frame must fall through to the caller's per-client seed;
+		// otherwise unrelated clients can share one sticky upstream connection.
+		sessionID = deriveOpenAIAnchoredContentSessionSeed(body)
 	}
 	if sessionID == "" {
 		return ""
@@ -215,12 +218,12 @@ func resolveOpenAIUpstreamOriginator(c *gin.Context, isOfficialClient bool) stri
 	return "opencode"
 }
 
-// BindStickySession sets session -> account binding with standard TTL.
+// BindStickySession sets session -> account binding with the idle-lease TTL.
 func (s *OpenAIGatewayService) BindStickySession(ctx context.Context, groupID *int64, sessionHash string, accountID int64) error {
 	if sessionHash == "" || accountID <= 0 {
 		return nil
 	}
-	ttl := openaiStickySessionTTL
+	ttl := s.openAIStickySessionIdleTTL(ctx)
 	if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds > 0 {
 		ttl = time.Duration(s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds) * time.Second
 	}
@@ -255,6 +258,12 @@ func NormalizeOpenAICompatiblePlatform(platform string) string {
 	default:
 		return PlatformOpenAI
 	}
+}
+
+// normalizeOpenAICompatiblePlatform retains the internal name used by the
+// upstream scheduler while the public helper serves handlers and tests.
+func normalizeOpenAICompatiblePlatform(platform string) string {
+	return NormalizeOpenAICompatiblePlatform(platform)
 }
 
 // noAvailableOpenAISelectionError builds the standard "no account available" error
@@ -450,6 +459,9 @@ func grokQuotaSnapshotStaleForPause(snapshot *xai.QuotaSnapshot, now time.Time) 
 
 func shouldAutoPauseOpenAIAccountByQuota(ctx context.Context, account *Account) (bool, openAIQuotaAutoPauseDecision) {
 	if account == nil || !account.IsOpenAI() {
+		return false, openAIQuotaAutoPauseDecision{}
+	}
+	if account.HasAvailableCodexCredits() {
 		return false, openAIQuotaAutoPauseDecision{}
 	}
 	// Per-account explicit-disable flags must take precedence over the global default.
@@ -771,7 +783,7 @@ func (s *OpenAIGatewayService) selectAccountForModelWithExclusions(ctx context.C
 	// 终检否决的账号不得成为新的粘性目标；无门保持既有 eager 绑定与 TTL）
 	// Set sticky session binding (deferred until terminal admission under a profit gate)
 	if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
-		_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, selected.ID, openaiStickySessionTTL)
+		_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, selected.ID, s.openAIStickySessionIdleTTL(ctx))
 	}
 
 	return hydrated, nil
@@ -839,7 +851,7 @@ func (s *OpenAIGatewayService) tryStickySessionHit(ctx context.Context, groupID 
 
 	// 刷新会话 TTL 并返回账号
 	// Refresh session TTL and return account
-	_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
+	_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, s.openAIStickySessionIdleTTL(ctx))
 	return account
 }
 
@@ -1055,7 +1067,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 							if selectErr != nil {
 								return nil, selectErr
 							}
-							_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, openaiStickySessionTTL)
+							_ = s.refreshStickySessionTTL(ctx, groupID, sessionHash, s.openAIStickySessionIdleTTL(ctx))
 							return selection, nil
 						}
 
@@ -1138,7 +1150,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 			if loadInfo == nil {
 				loadInfo = &AccountLoadInfo{AccountID: acc.ID}
 			}
-			if loadInfo.LoadRate < 100 {
+			if accountHasImmediateConcurrencySlot(acc, loadInfo) {
 				available = append(available, accountWithLoad{
 					account:  acc,
 					loadInfo: loadInfo,
@@ -1151,25 +1163,8 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 		}
 
 		sort.SliceStable(available, func(i, j int) bool {
-			a, b := available[i], available[j]
-			if a.account.Priority != b.account.Priority {
-				return a.account.Priority < b.account.Priority
-			}
-			if a.loadInfo.LoadRate != b.loadInfo.LoadRate {
-				return a.loadInfo.LoadRate < b.loadInfo.LoadRate
-			}
-			switch {
-			case a.account.LastUsedAt == nil && b.account.LastUsedAt != nil:
-				return true
-			case a.account.LastUsedAt != nil && b.account.LastUsedAt == nil:
-				return false
-			case a.account.LastUsedAt == nil && b.account.LastUsedAt == nil:
-				return false
-			default:
-				return a.account.LastUsedAt.Before(*b.account.LastUsedAt)
-			}
+			return packedAccountWithLoadLess(available[i], available[j], false)
 		})
-		shuffleWithinSortGroups(available)
 		if rateOrder.enabled {
 			sort.SliceStable(available, func(i, j int) bool {
 				return rateOrder.compare(available[i].account, available[j].account) < 0
@@ -1214,7 +1209,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 					return nil, true, selectErr
 				}
 				if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
-					_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, fresh.ID, openaiStickySessionTTL)
+					_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, fresh.ID, s.openAIStickySessionIdleTTL(ctx))
 				}
 				return selection, true, nil
 			}
@@ -1253,7 +1248,7 @@ func (s *OpenAIGatewayService) selectAccountWithLoadAwareness(ctx context.Contex
 					return nil, selectErr
 				}
 				if sessionHash != "" && !gatewayProfitControlGateActive(ctx) {
-					_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, fresh.ID, openaiStickySessionTTL)
+					_ = s.setStickySessionAccountID(ctx, groupID, sessionHash, fresh.ID, s.openAIStickySessionIdleTTL(ctx))
 				}
 				return selection, nil
 			}

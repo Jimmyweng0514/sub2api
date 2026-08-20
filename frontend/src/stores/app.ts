@@ -26,7 +26,7 @@ export const useAppStore = defineStore('app', () => {
   // Public settings cache state
   const publicSettingsLoaded = ref<boolean>(false)
   const publicSettingsLoading = ref<boolean>(false)
-  const siteName = ref<string>('Sub2API')
+  const siteName = ref<string>('Sub2API Plus')
   const siteLogo = ref<string>('')
   const siteVersion = ref<string>('')
   const contactInfo = ref<string>('')
@@ -41,8 +41,13 @@ export const useAppStore = defineStore('app', () => {
   const currentVersion = ref<string>('')
   const latestVersion = ref<string>('')
   const hasUpdate = ref<boolean>(false)
-  const buildType = ref<string>('source')
+  const buildType = ref<VersionInfo['build_type']>('source')
+  const updateRepo = ref<string>('')
   const releaseInfo = ref<ReleaseInfo | null>(null)
+  const versionWarning = ref<string>('')
+  const versionCached = ref<boolean>(false)
+  const versionCheckError = ref<string>('')
+  const inPlaceUpdate = ref<VersionInfo['in_place_update'] | null>(null)
 
   // Auto-incrementing ID for toasts
   let toastIdCounter = 0
@@ -248,8 +253,11 @@ export const useAppStore = defineStore('app', () => {
         latest_version: latestVersion.value,
         has_update: hasUpdate.value,
         build_type: buildType.value,
+        update_repo: updateRepo.value,
         release_info: releaseInfo.value || undefined,
-        cached: true
+        warning: versionWarning.value || undefined,
+        cached: true,
+        in_place_update: inPlaceUpdate.value || undefined
       }
     }
 
@@ -265,11 +273,18 @@ export const useAppStore = defineStore('app', () => {
       latestVersion.value = data.latest_version
       hasUpdate.value = data.has_update
       buildType.value = data.build_type || 'source'
+      updateRepo.value = data.update_repo || ''
       releaseInfo.value = data.release_info || null
+      versionWarning.value = data.warning || ''
+      versionCached.value = data.cached === true
+      versionCheckError.value = ''
+      inPlaceUpdate.value = data.in_place_update || null
       versionLoaded.value = true
       return data
     } catch (error) {
       console.error('Failed to fetch version:', error)
+      versionCheckError.value =
+        (error as { message?: string }).message || i18n.global.t('common.unknownError')
       return null
     } finally {
       versionLoading.value = false
@@ -282,6 +297,10 @@ export const useAppStore = defineStore('app', () => {
   function clearVersionCache(): void {
     versionLoaded.value = false
     hasUpdate.value = false
+    versionWarning.value = ''
+    versionCached.value = false
+    versionCheckError.value = ''
+    inPlaceUpdate.value = null
   }
 
   // ==================== Public Settings Management ====================
@@ -294,7 +313,7 @@ export const useAppStore = defineStore('app', () => {
       window.__APP_CONFIG__ = { ...config }
     }
     cachedPublicSettings.value = config
-    siteName.value = config.site_name || 'Sub2API'
+    siteName.value = config.site_name || 'Sub2API Plus'
     siteLogo.value = config.site_logo || ''
     siteVersion.value = config.version || ''
     contactInfo.value = config.contact_info || ''
@@ -458,7 +477,12 @@ export const useAppStore = defineStore('app', () => {
     latestVersion,
     hasUpdate,
     buildType,
+    updateRepo,
     releaseInfo,
+    versionWarning,
+    versionCached,
+    versionCheckError,
+    inPlaceUpdate,
 
     // Computed
     hasActiveToasts,

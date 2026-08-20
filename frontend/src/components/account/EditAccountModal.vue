@@ -1617,7 +1617,7 @@
 
       <!-- OpenAI Codex namespace 工具摊平（兼容开关，仅 OAuth） -->
       <div
-        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        v-if="account?.platform === 'openai' && account?.type === 'oauth' && !isSparkShadow"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
       >
         <div class="flex items-center justify-between">
@@ -2068,7 +2068,7 @@
 
       <!-- Codex 指纹收敛模式（仅 OpenAI OAuth） -->
       <div
-        v-if="account?.platform === 'openai' && account?.type === 'oauth'"
+        v-if="account?.platform === 'openai' && account?.type === 'oauth' && !isSparkShadow"
         class="border-t border-gray-200 pt-4 dark:border-dark-600"
       >
         <div class="flex items-center justify-between gap-4">
@@ -2079,8 +2079,39 @@
             </p>
           </div>
           <div class="w-52 flex-shrink-0">
-            <Select v-model="codexFingerprintMode" data-testid="edit-codex-fingerprint-mode-select" :options="codexFingerprintModeOptions" />
+            <Select
+              v-model="codexFingerprintMode"
+              data-testid="edit-codex-fingerprint-mode-select"
+              :options="codexFingerprintModeOptions"
+              @update:model-value="codexFingerprintModeTouched = true"
+            />
           </div>
+        </div>
+        <p
+          v-if="account?.extra?.codex_fingerprint_recovery_required === true"
+          data-testid="edit-codex-fingerprint-recovery-warning"
+          class="mt-3 rounded-md bg-amber-50 p-3 text-xs text-amber-700 dark:bg-amber-900/20 dark:text-amber-300"
+        >
+          {{ t('admin.accounts.openai.codexFingerprintRecoveryRequired') }}
+        </p>
+      </div>
+
+      <!-- 奸商模式（仅 OpenAI OAuth） -->
+      <div
+        v-if="account?.platform === 'openai' && account?.type === 'oauth' && !isSparkShadow"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.codex429Guard') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.codex429GuardHint') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="codex429GuardEnabled"
+            data-testid="edit-codex-429-guard-toggle"
+          />
         </div>
       </div>
 
@@ -2686,7 +2717,9 @@
           <label class="flex cursor-pointer items-center gap-2">
             <input
               type="checkbox"
-              v-model="allowOverages"
+              :checked="allowOverages"
+              @change="handleAllowOveragesChange"
+              data-testid="allow-overages-toggle"
               class="h-4 w-4 rounded border-gray-300 text-primary-500 focus:ring-primary-500 dark:border-dark-500"
             />
             <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -2828,6 +2861,7 @@ import {
 import { formatDateTime, formatDateTimeLocalInput, parseDateTimeLocalInput } from '@/utils/format'
 import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
 import { allSelectedGroupsEnableLongContextPricing } from '@/components/account/longContextBilling'
+import { isAntigravityProTier } from '@/utils/antigravityOverages'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
 import {
   OPENAI_WS_MODE_CTX_POOL,
@@ -3102,6 +3136,26 @@ const upstreamBillingAutoProbeEnabled = ref(false)
 const upstreamBillingRateSyncEnabled = ref(false)
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
 const allowOverages = ref(false) // For antigravity accounts: enable AI Credits overages
+
+const isGoogleOneProAccount = computed(() => {
+  const credentials = (props.account?.credentials || {}) as Record<string, unknown>
+  const extra = (props.account?.extra || {}) as Record<string, unknown>
+  return isAntigravityProTier(credentials, extra)
+})
+
+function handleAllowOveragesChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const enabled = input.checked
+  if (!enabled) {
+    allowOverages.value = false
+    return
+  }
+  const warningKey = isGoogleOneProAccount.value
+    ? 'admin.accounts.allowOveragesProConfirm'
+    : 'admin.accounts.allowOveragesConfirm'
+  allowOverages.value = confirm(t(warningKey))
+  input.checked = allowOverages.value
+}
 const antigravityProjectId = ref('')
 const antigravityModelRestrictionMode = ref<'whitelist' | 'mapping'>('whitelist')
 const antigravityWhitelistModels = ref<string[]>([])
@@ -3170,6 +3224,8 @@ const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
+const codexFingerprintModeTouched = ref(false)
+const codex429GuardEnabled = ref(false)
 type CodexImageToolMode = 'inherit' | 'enabled' | 'disabled' | 'block'
 const codexImageToolMode = ref<CodexImageToolMode>('inherit')
 type AnthropicAPIKeyAuthScheme = 'x_api_key' | 'authorization_bearer'
@@ -3207,7 +3263,6 @@ const codexFingerprintModeOptions = computed(() => [
   { value: 'session' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintSession') },
   { value: 'full' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintFull') },
 ])
-
 const openAIWSModeOptions = computed(() => [
   { value: OPENAI_WS_MODE_OFF, label: t('admin.accounts.openai.wsModeOff') },
   { value: OPENAI_WS_MODE_CTX_POOL, label: t('admin.accounts.openai.wsModeCtxPool') },
@@ -3644,6 +3699,8 @@ const syncFormFromAccount = (newAccount: Account | null) => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
+  codexFingerprintModeTouched.value = false
+  codex429GuardEnabled.value = false
   codexImageToolMode.value = 'inherit'
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
@@ -3697,10 +3754,11 @@ const syncFormFromAccount = (newAccount: Account | null) => {
     }
     if (newAccount.type === 'oauth') {
       const fpMode = extra?.codex_fingerprint_mode as string | undefined
-      // 缺省/非法值按 off 呈现，与后端 GetCodexFingerprintMode 的 opt-in 语义一致（#5610）
-      codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(fpMode || '')
-        ? fpMode as CodexFingerprintMode
+      const normalizedFPMode = fpMode?.trim().toLowerCase()
+      codexFingerprintMode.value = (['off', 'device', 'session', 'full'].includes(normalizedFPMode || '')
+        ? normalizedFPMode as CodexFingerprintMode
         : 'off')
+      codex429GuardEnabled.value = extra?.openai_codex_429_guard_enabled === true
     }
     const credentials = newAccount.credentials as Record<string, unknown> | undefined
     const compactMappings = credentials?.compact_model_mapping as Record<string, string> | undefined
@@ -4431,13 +4489,20 @@ const openMixedChannelDialog = (opts: {
 }
 
 const withAntigravityConfirmFlag = (payload: Record<string, unknown>) => {
+  const confirmedPayload = { ...payload }
+  const extra = payload.extra as Record<string, unknown> | undefined
+  if (props.account?.platform === 'antigravity' && extra?.allow_overages === true) {
+    confirmedPayload.confirm_overages_risk = true
+  } else {
+    delete confirmedPayload.confirm_overages_risk
+  }
   if (needsMixedChannelCheck() && antigravityMixedChannelConfirmed.value) {
     return {
-      ...payload,
+      ...confirmedPayload,
       confirm_mixed_channel_risk: true
     }
   }
-  const cloned = { ...payload }
+  const cloned = { ...confirmedPayload }
   delete cloned.confirm_mixed_channel_risk
   return cloned
 }
@@ -5117,14 +5182,27 @@ const handleSubmit = async () => {
         }
       }
 
-      // 指纹收敛模式：默认 off（不写入）；device/session/full 是显式 opt-in，
-      // 必须落键，否则管理员的选择会被后端当作"未设置"而回落到 off（#5610）。
-      if (props.account.type === 'oauth') {
-        if (codexFingerprintMode.value !== 'off') {
+      if (props.account.type === 'oauth' && !isSparkShadow.value) {
+        // Keep the historical recovery marker until the administrator has
+        // actually touched this selector. Explicit off is represented by null
+        // so the backend can distinguish it from an unrelated full-form save.
+        if (!codexFingerprintModeTouched.value) {
+          // Preserve the current account override exactly as loaded.
+        } else if (codexFingerprintMode.value !== 'off') {
           newExtra.codex_fingerprint_mode = codexFingerprintMode.value
         } else {
-          delete newExtra.codex_fingerprint_mode
+          newExtra.codex_fingerprint_mode = null
         }
+        if (codexFingerprintModeTouched.value) {
+          updatePayload.codex_fingerprint_mode_touched = true
+        }
+        newExtra.openai_codex_429_guard_enabled = codex429GuardEnabled.value
+      } else {
+        delete newExtra.codex_fingerprint_mode
+        delete newExtra.codex_fingerprint_seed
+        delete newExtra.openai_device_id
+        delete newExtra.openai_session_id
+        delete newExtra.openai_codex_429_guard_enabled
       }
 
       updatePayload.extra = newExtra

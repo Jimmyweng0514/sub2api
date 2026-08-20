@@ -33,6 +33,7 @@ backend/.gocache/
 # ===================
 node_modules/
 frontend/node_modules/
+.pnpm-store/
 frontend/dist/
 *.local
 *.tsbuildinfo
@@ -130,8 +131,13 @@ AGENTS.md
 backend/cmd/server/server
 deploy/docker-compose.override.yml
 .gocache/
+.gomodcache/
 vite.config.js
 docs/*
+!docs/releases/
+!docs/releases/*.md
+!docs/HANDOVER*.md
+!docs/README.md
 !docs/PAYMENT.md
 !docs/PAYMENT_CN.md
 !docs/ADMIN_PAYMENT_INTEGRATION_API.md

@@ -17,26 +17,28 @@ const (
 	openAITeamLinkedErrorBlockReason   = "team_linked_error"
 )
 
-// maybeHandleOpenAITeamLinkedError 在 OpenAI OAuth 账户收到 402 deactivated_workspace
-// （ChatGPT Team 工作区被停用）时，把同一 Team（credentials.chatgpt_account_id 相同）
-// 的其余 active 账户一并置为 error 并立即熔断。触发账户自身不在 fan-out 范围内，
-// 仍由常规 402 处理标记。
+// maybeHandleOpenAITeamLinkedError fans a deactivated ChatGPT Team workspace
+// error out to its sibling OAuth accounts. The triggering account remains the
+// responsibility of the ordinary upstream error path.
 func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context, account *Account, statusCode int, responseBody []byte) {
 	if s == nil || s.accountRepo == nil || statusCode != http.StatusPaymentRequired || !isOpenAIOAuthAccount(account) {
 		return
 	}
-	if gjson.GetBytes(responseBody, "detail.code").String() != "deactivated_workspace" {
+	if strings.TrimSpace(gjson.GetBytes(responseBody, "detail.code").String()) != "deactivated_workspace" {
 		return
 	}
 	teamID := strings.TrimSpace(account.GetChatGPTAccountID())
-	if teamID == "" {
+	if teamID == "" || !s.markOpenAITeamLinkedFired(teamID) {
 		return
 	}
-	if !s.markOpenAITeamLinkedFired(teamID) {
-		return
+
+	// Upstream error contexts may already be cancelled. Keep persistence
+	// independent while preserving any values that callers placed on ctx.
+	base := ctx
+	if base == nil {
+		base = context.Background()
 	}
-	// 上游报错场景请求 ctx 往往已被取消，落库需要独立生命周期。
-	opCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAITeamLinkedErrorFanoutTimeout)
+	opCtx, cancel := context.WithTimeout(context.WithoutCancel(base), openAITeamLinkedErrorFanoutTimeout)
 	defer cancel()
 
 	accounts, err := s.accountRepo.ListByPlatform(opCtx, PlatformOpenAI)
@@ -44,28 +46,28 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 		slog.Warn("openai_team_linked_error_list_failed", "trigger_account_id", account.ID, "error", err)
 		return
 	}
-	var targets []*Account
+	targets := make([]*Account, 0, len(accounts))
 	for i := range accounts {
-		acc := &accounts[i]
-		if acc.ID == account.ID || acc.IsShadow() || strings.TrimSpace(acc.GetChatGPTAccountID()) != teamID {
+		candidate := &accounts[i]
+		if candidate.ID == account.ID || candidate.IsShadow() || strings.TrimSpace(candidate.GetChatGPTAccountID()) != teamID {
 			continue
 		}
-		targets = append(targets, acc)
+		targets = append(targets, candidate)
 	}
 	if len(targets) == 0 {
 		return
 	}
-	// 先全部进程内熔断（微秒级生效），再逐个落库，避免后面的账户等待前面的 DB 写入。
-	for _, acc := range targets {
-		s.notifyAccountSchedulingBlocked(acc, time.Time{}, openAITeamLinkedErrorBlockReason)
+
+	// Make the scheduler stop selecting every sibling before the first database
+	// write, then persist each state independently.
+	for _, candidate := range targets {
+		s.notifyAccountSchedulingBlocked(candidate, time.Time{}, openAITeamLinkedErrorBlockReason)
 	}
-	errorMsg := fmt.Sprintf("Workspace deactivated (402): team-linked error triggered by account #%d", account.ID)
+	errorMessage := fmt.Sprintf("Workspace deactivated (402): team-linked error triggered by account #%d", account.ID)
 	marked := 0
-	for _, acc := range targets {
-		// 单账户写入失败不中断其余账户；进程内熔断已先行，且该账户仍为 active，
-		// 下一个 402 在去重 TTL 过期后会重新触发 fan-out。
-		if err := s.accountRepo.SetError(opCtx, acc.ID, errorMsg); err != nil {
-			slog.Warn("openai_team_linked_error_set_error_failed", "account_id", acc.ID, "error", err)
+	for _, candidate := range targets {
+		if err := s.accountRepo.SetError(opCtx, candidate.ID, errorMessage); err != nil {
+			slog.Warn("openai_team_linked_error_set_error_failed", "account_id", candidate.ID, "error", err)
 			continue
 		}
 		marked++
@@ -78,20 +80,23 @@ func (s *RateLimitService) maybeHandleOpenAITeamLinkedError(ctx context.Context,
 	)
 }
 
-// markOpenAITeamLinkedFired 以 teamID 为键做进程内去重：TTL 内同一 Team 只允许一次 fan-out。
+// markOpenAITeamLinkedFired allows one fan-out per Team during the dedup TTL.
 func (s *RateLimitService) markOpenAITeamLinkedFired(teamID string) bool {
+	if s == nil || strings.TrimSpace(teamID) == "" {
+		return false
+	}
 	now := time.Now()
 	s.openaiTeamLinkedMu.Lock()
 	defer s.openaiTeamLinkedMu.Unlock()
-	if expiry, ok := s.openaiTeamLinkedRecent[teamID]; ok && expiry.After(now) {
-		return false
-	}
 	if s.openaiTeamLinkedRecent == nil {
 		s.openaiTeamLinkedRecent = make(map[string]time.Time)
 	}
-	for k, v := range s.openaiTeamLinkedRecent {
-		if !v.After(now) {
-			delete(s.openaiTeamLinkedRecent, k)
+	if expiry, ok := s.openaiTeamLinkedRecent[teamID]; ok && expiry.After(now) {
+		return false
+	}
+	for key, expiry := range s.openaiTeamLinkedRecent {
+		if !expiry.After(now) {
+			delete(s.openaiTeamLinkedRecent, key)
 		}
 	}
 	s.openaiTeamLinkedRecent[teamID] = now.Add(openAITeamLinkedErrorDedupTTL)

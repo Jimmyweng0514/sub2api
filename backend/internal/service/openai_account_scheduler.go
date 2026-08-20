@@ -21,6 +21,7 @@ import (
 
 const (
 	openAIAccountScheduleLayerPreviousResponse = "previous_response_id"
+	openAIAccountScheduleLayer429Continuation  = "429_guard_continuation"
 	openAIAccountScheduleLayerSessionSticky    = "session_hash"
 	openAIAccountScheduleLayerLoadBalance      = "load_balance"
 	openAIAdvancedSchedulerSettingKey          = "openai_advanced_scheduler_enabled"
@@ -49,6 +50,7 @@ type cachedOpenAIAdvancedSchedulerSetting struct {
 	stickyWeightedEnabled          bool
 	subscriptionPriorityEnabled    bool
 	lbTopKOverride                 int
+	stickyIdleTTLSeconds           int
 	weightOverrides                map[string]float64
 	expiresAt                      int64
 }
@@ -60,6 +62,7 @@ type openAIAdvancedSchedulerRuntimeSettings struct {
 	stickyWeightedEnabled          bool
 	subscriptionPriorityEnabled    bool
 	lbTopKOverride                 int
+	stickyIdleTTLSeconds           int
 	weightOverrides                map[string]float64
 }
 
@@ -89,9 +92,13 @@ type OpenAIAccountScheduleRequest struct {
 }
 
 type OpenAIAccountScheduleDecision struct {
-	Layer               string
-	StickyPreviousHit   bool
-	StickySessionHit    bool
+	Layer             string
+	StickyPreviousHit bool
+	StickySessionHit  bool
+	// ContinuationLease is true only when an already rate-limited OpenAI OAuth
+	// account is reused through a still-local pooled WebSocket connection.
+	// It is never set for a new session or for a remote/cache-only response ID.
+	ContinuationLease   bool
 	CandidateCount      int
 	TopK                int
 	LatencyMs           int64
@@ -429,6 +436,14 @@ func (s *defaultOpenAIAccountScheduler) Select(
 		}
 		if escapedSticky {
 			req.PreserveStickyBinding = true
+			excluded := make(map[int64]struct{}, len(req.ExcludedIDs)+1)
+			for accountID := range req.ExcludedIDs {
+				excluded[accountID] = struct{}{}
+			}
+			if req.StickyAccountID > 0 {
+				excluded[req.StickyAccountID] = struct{}{}
+			}
+			req.ExcludedIDs = excluded
 		}
 	}
 
@@ -541,16 +556,17 @@ func (s *defaultOpenAIAccountScheduler) selectBySessionHash(
 
 	cfg := s.service.schedulingConfig()
 	// WaitPlan.MaxConcurrency 使用 Concurrency（非 EffectiveLoadFactor），因为 WaitPlan 控制的是 Redis 实际并发槽位等待。
+	//
+	// 并发满时不逃逸：粘性账号打满是"先把一个号打满"的正常结果，直接换号会把同一
+	// 会话拆到多个账号、上游 prompt cache 全部失效。默认返回等待计划，让请求继续
+	// 在粘性账号上排队（受 StickySessionWaitTimeout / StickySessionMaxWaiting 约束）。
 	if s.service.concurrencyService != nil {
-		if escapeCfg.enabled && acquireErr == nil && result != nil && !result.Acquired {
-			errorRate, ttft, _ := s.stats.snapshot(accountID)
-			slog.Info("sticky_escape_triggered",
-				"account_id", accountID,
-				"reason", "concurrency_full",
-				"error_rate", errorRate,
-				"ttft", ttft,
-			)
-			return nil, true, nil
+		// 溢出阀仅属于逃逸语义：管理员显式开启逃逸且配置了等待上限时，等待队列
+		// 饱和的粘性请求才释放到负载均衡（保留绑定）；逃逸关闭或未设上限则一律排队。
+		if escapeCfg.enabled && cfg.StickySessionMaxWaiting > 0 {
+			if waitingCount, waitErr := s.service.concurrencyService.GetAccountWaitingCount(ctx, accountID); waitErr == nil && waitingCount >= cfg.StickySessionMaxWaiting {
+				return nil, true, nil
+			}
 		}
 		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
 			Account: account,
@@ -999,7 +1015,13 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAIAccountLoadPlan(
 	if plan.topK <= 0 {
 		plan.topK = 1
 	}
-
+	for _, candidate := range candidates {
+		if candidate.account != nil && candidate.account.Concurrency > 0 &&
+			(candidate.loadInfo.CurrentConcurrency >= candidate.account.Concurrency || candidate.loadInfo.LoadRate >= 100) {
+			plan.includeOverflowFallback = true
+			break
+		}
+	}
 	plan.selectionOrder = s.buildOpenAISelectionOrder(req, plan)
 	return plan
 }
@@ -1016,7 +1038,37 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 		if groupTopK > len(pool) {
 			groupTopK = len(pool)
 		}
-		ranked := selectTopKOpenAICandidates(pool, groupTopK)
+		packedCandidateLess := func(aCandidate, bCandidate openAIAccountCandidateScore) bool {
+			a := accountWithLoad{account: aCandidate.account, loadInfo: aCandidate.loadInfo}
+			b := accountWithLoad{account: bCandidate.account, loadInfo: bCandidate.loadInfo}
+			if a.account.Priority != b.account.Priority {
+				return a.account.Priority < b.account.Priority
+			}
+			aClass := packedAccountLoadClass(a.account, a.loadInfo)
+			bClass := packedAccountLoadClass(b.account, b.loadInfo)
+			if aClass != bClass {
+				return aClass < bClass
+			}
+			if aClass == 0 {
+				if packedActiveAccountUtilizationLess(a, b) {
+					return true
+				}
+				if packedActiveAccountUtilizationLess(b, a) {
+					return false
+				}
+			}
+			if aCandidate.score != bCandidate.score {
+				return aCandidate.score > bCandidate.score
+			}
+			return a.account.ID < b.account.ID
+		}
+		ranked := append([]openAIAccountCandidateScore(nil), pool...)
+		sort.SliceStable(ranked, func(i, j int) bool {
+			return packedCandidateLess(ranked[i], ranked[j])
+		})
+		if len(ranked) > groupTopK {
+			ranked = ranked[:groupTopK]
+		}
 		var primary []openAIAccountCandidateScore
 		if req.StickyWeighted {
 			for _, stickyID := range []int64{req.StickyPreviousAccountID, req.StickyAccountID} {
@@ -1036,7 +1088,7 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 			}
 		}
 		if len(primary) == 0 {
-			primary = buildOpenAIWeightedSelectionOrder(ranked, req)
+			primary = ranked
 		}
 		if !plan.includeOverflowFallback || groupTopK >= len(pool) {
 			return primary
@@ -1052,8 +1104,8 @@ func (s *defaultOpenAIAccountScheduler) buildOpenAISelectionOrder(
 				overflow = append(overflow, candidate)
 			}
 		}
-		sort.Slice(overflow, func(i, j int) bool {
-			return isOpenAIAccountCandidateBetter(overflow[i], overflow[j])
+		sort.SliceStable(overflow, func(i, j int) bool {
+			return packedCandidateLess(overflow[i], overflow[j])
 		})
 		return append(primary, overflow...)
 	}
@@ -1835,6 +1887,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				stickyWeightedEnabled:          cached.stickyWeightedEnabled,
 				subscriptionPriorityEnabled:    cached.subscriptionPriorityEnabled,
 				lbTopKOverride:                 cached.lbTopKOverride,
+				stickyIdleTTLSeconds:           cached.stickyIdleTTLSeconds,
 				weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(cached.weightOverrides),
 			}
 		}
@@ -1850,6 +1903,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 					stickyWeightedEnabled:          cached.stickyWeightedEnabled,
 					subscriptionPriorityEnabled:    cached.subscriptionPriorityEnabled,
 					lbTopKOverride:                 cached.lbTopKOverride,
+					stickyIdleTTLSeconds:           cached.stickyIdleTTLSeconds,
 					weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(cached.weightOverrides),
 				}, nil
 			}
@@ -1861,6 +1915,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 		stickyWeightedEnabled := false
 		subscriptionPriorityEnabled := false
 		lbTopKOverride := 0
+		stickyIdleTTLSeconds := 0
 		weightOverrides := map[string]float64{}
 		if repo := s.openAIAdvancedSchedulerSettingRepo(); repo != nil {
 			dbCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), openAIAdvancedSchedulerSettingDBTimeout)
@@ -1873,6 +1928,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				stickyWeightedEnabled = strings.EqualFold(strings.TrimSpace(values[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled]), "true")
 				subscriptionPriorityEnabled = strings.EqualFold(strings.TrimSpace(values[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled]), "true")
 				lbTopKOverride = parsePositiveIntOverride(values[SettingKeyOpenAIAdvancedSchedulerLBTopK])
+				stickyIdleTTLSeconds = parsePositiveIntOverride(values[SettingKeyOpenAIStickySessionIdleTTLSeconds])
 				weightOverrides = parseOpenAIAdvancedSchedulerWeightOverrides(values)
 			} else {
 				// 批量读取失败时逐键降级，覆盖全部键（含 TopK/权重），避免只加载布尔开关
@@ -1890,6 +1946,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 				stickyWeightedEnabled = strings.EqualFold(strings.TrimSpace(fallbackValues[SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled]), "true")
 				subscriptionPriorityEnabled = strings.EqualFold(strings.TrimSpace(fallbackValues[SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled]), "true")
 				lbTopKOverride = parsePositiveIntOverride(fallbackValues[SettingKeyOpenAIAdvancedSchedulerLBTopK])
+				stickyIdleTTLSeconds = parsePositiveIntOverride(fallbackValues[SettingKeyOpenAIStickySessionIdleTTLSeconds])
 				weightOverrides = parseOpenAIAdvancedSchedulerWeightOverrides(fallbackValues)
 			}
 		}
@@ -1901,6 +1958,7 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 			stickyWeightedEnabled:          stickyWeightedEnabled,
 			subscriptionPriorityEnabled:    subscriptionPriorityEnabled,
 			lbTopKOverride:                 lbTopKOverride,
+			stickyIdleTTLSeconds:           stickyIdleTTLSeconds,
 			weightOverrides:                cloneOpenAIAdvancedSchedulerWeightOverrides(weightOverrides),
 			expiresAt:                      time.Now().Add(openAIAdvancedSchedulerSettingCacheTTL).UnixNano(),
 		})
@@ -1911,12 +1969,27 @@ func (s *OpenAIGatewayService) openAIAdvancedSchedulerRuntimeSettings(ctx contex
 			stickyWeightedEnabled:          stickyWeightedEnabled,
 			subscriptionPriorityEnabled:    subscriptionPriorityEnabled,
 			lbTopKOverride:                 lbTopKOverride,
+			stickyIdleTTLSeconds:           stickyIdleTTLSeconds,
 			weightOverrides:                weightOverrides,
 		}, nil
 	})
 
 	settings, _ := result.(openAIAdvancedSchedulerRuntimeSettings)
 	return settings
+}
+
+// openAIStickySessionIdleTTL 返回粘性会话的空闲租约时长。
+// 会话在该窗口内没有新请求即释放账号绑定；每次请求命中都会续期（滑动窗口）。
+// 默认 60s，可通过设置键 openai_sticky_session_idle_ttl_seconds 运行时调整。
+func (s *OpenAIGatewayService) openAIStickySessionIdleTTL(ctx context.Context) time.Duration {
+	if s == nil {
+		return openaiStickySessionIdleTTLDefault
+	}
+	seconds := s.openAIAdvancedSchedulerRuntimeSettings(ctx).stickyIdleTTLSeconds
+	if seconds <= 0 {
+		seconds = int(openaiStickySessionIdleTTLDefault / time.Second)
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 func (s *OpenAIGatewayService) isOpenAIAdvancedSchedulerEnabled(ctx context.Context) bool {
@@ -1950,6 +2023,7 @@ func openAIAdvancedSchedulerRuntimeSettingKeys() []string {
 		SettingKeyOpenAIAdvancedSchedulerStickyWeightedEnabled,
 		SettingKeyOpenAIAdvancedSchedulerSubscriptionPriorityEnabled,
 		SettingKeyOpenAIAdvancedSchedulerLBTopK,
+		SettingKeyOpenAIStickySessionIdleTTLSeconds,
 	}
 	for _, spec := range openAIAdvancedSchedulerWeightOverrideSpecs() {
 		keys = append(keys, spec.key)
@@ -2163,6 +2237,38 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 	}
 	platform = NormalizeOpenAICompatiblePlatform(platform)
 	decision := OpenAIAccountScheduleDecision{}
+	// Pricing restrictions are a request-level gate and must run before every
+	// scheduling fast path, including a 429-guard continuation. A bound old
+	// connection does not grant permission to use a restricted model/channel.
+	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
+		slog.Warn("channel pricing restriction blocked request",
+			"group_id", derefGroupID(groupID),
+			"model", requestedModel)
+		return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
+	}
+	if selection, continuation, continuationErr := s.selectOpenAI429GuardContinuation(
+		ctx,
+		groupID,
+		platform,
+		previousResponseID,
+		sessionHash,
+		requestedModel,
+		excludedIDs,
+		requiredTransport,
+		requiredCapability,
+		requireCompact,
+		requiredImageCapability,
+	); continuationErr != nil {
+		return nil, decision, continuationErr
+	} else if continuation && selection != nil && selection.Account != nil {
+		decision.Layer = openAIAccountScheduleLayer429Continuation
+		decision.StickyPreviousHit = strings.TrimSpace(previousResponseID) != ""
+		decision.StickySessionHit = !decision.StickyPreviousHit && strings.TrimSpace(sessionHash) != ""
+		decision.ContinuationLease = true
+		decision.SelectedAccountID = selection.Account.ID
+		decision.SelectedAccountType = selection.Account.Type
+		return selection, decision, nil
+	}
 	scheduler := s.getOpenAIAccountScheduler(ctx)
 	if scheduler == nil {
 		decision.Layer = openAIAccountScheduleLayerLoadBalance
@@ -2218,13 +2324,6 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		}
 	}
 
-	if s.checkChannelPricingRestriction(ctx, groupID, requestedModel) {
-		slog.Warn("channel pricing restriction blocked request",
-			"group_id", derefGroupID(groupID),
-			"model", requestedModel)
-		return nil, decision, fmt.Errorf("%w supporting model: %s (channel pricing restriction)", ErrNoAvailableAccounts, requestedModel)
-	}
-
 	var stickyAccountID int64
 	if sessionHash != "" && s.cache != nil {
 		if accountID, err := s.getStickySessionAccountID(ctx, groupID, sessionHash); err == nil && accountID > 0 {
@@ -2256,6 +2355,228 @@ func (s *OpenAIGatewayService) selectAccountWithSchedulerOnce(
 		RequireCompact:          requireCompact,
 		ExcludedIDs:             excludedIDs,
 	})
+}
+
+// selectOpenAI429GuardContinuation is the only scheduling escape hatch for a
+// rate-limited OpenAI OAuth account. It requires a local response/session
+// binding plus the exact permanently guard-pinned socket in this process. The
+// ingress layer then force-acquires that connection, so a cache record can
+// never turn into a fresh request against a limited account.
+func (s *OpenAIGatewayService) selectOpenAI429GuardContinuation(
+	ctx context.Context,
+	groupID *int64,
+	platform string,
+	previousResponseID string,
+	sessionHash string,
+	requestedModel string,
+	excludedIDs map[int64]struct{},
+	requiredTransport OpenAIUpstreamTransport,
+	requiredCapability OpenAIEndpointCapability,
+	requireCompact bool,
+	requiredImageCapability OpenAIImagesCapability,
+) (*AccountSelectionResult, bool, error) {
+	if s == nil || normalizeOpenAICompatiblePlatform(platform) != PlatformOpenAI ||
+		requiredTransport != OpenAIUpstreamTransportResponsesWebsocketV2Ingress ||
+		requiredImageCapability != "" {
+		return nil, false, nil
+	}
+	responseID := strings.TrimSpace(previousResponseID)
+	store := s.getOpenAIWSStateStore()
+	if store == nil {
+		return nil, false, nil
+	}
+	group := derefGroupID(groupID)
+	responseConnID := ""
+	accountID := int64(0)
+	var err error
+	if responseID != "" {
+		// A response binding is a pair: never combine its connection with a
+		// session binding (or vice versa), since that can produce account A +
+		// connection B and force-close a healthy socket as "unavailable".
+		if connID, ok := store.GetResponseConn(responseID); ok {
+			responseConnID = connID
+			accountID, err = store.GetResponseAccount(ctx, group, responseID)
+			if err != nil || accountID <= 0 {
+				return nil, false, nil
+			}
+		} else {
+			return nil, false, nil
+		}
+	} else if strings.TrimSpace(sessionHash) != "" {
+		// OAuth Responses requests commonly use store=false. A reconnect may
+		// omit previous_response_id while still carrying the stable session hash;
+		// prefer the process-local guard tuple, then fall back to the ordinary
+		// sticky account cache for non-guard sessions.
+		if guardStore, ok := store.(openAIWSGuardBindingStore); ok {
+			if guardAccountID, guardConnID, guardOK := guardStore.GetGuardSession(group, strings.TrimSpace(sessionHash)); guardOK {
+				accountID = guardAccountID
+				responseConnID = strings.TrimSpace(guardConnID)
+			}
+		}
+		if accountID <= 0 {
+			if connID, ok := store.GetSessionConn(group, strings.TrimSpace(sessionHash)); ok {
+				responseConnID = connID
+				accountID, err = s.getStickySessionAccountID(ctx, groupID, strings.TrimSpace(sessionHash))
+				if err != nil || accountID <= 0 {
+					return nil, false, nil
+				}
+			} else {
+				return nil, false, nil
+			}
+		}
+	} else {
+		return nil, false, nil
+	}
+	if err != nil || accountID <= 0 {
+		// Sticky state is an optimization. A cache/store read failure must not
+		// turn into a gateway-wide scheduling outage; the normal scheduler can
+		// still choose a healthy account.
+		return nil, false, nil
+	}
+	if _, excluded := excludedIDs[accountID]; excluded {
+		return nil, false, nil
+	}
+	account, err := s.getSchedulableAccount(ctx, accountID)
+	if err != nil {
+		// A sticky guard binding is only an optimization. A transient account
+		// repository failure must fall back to normal scheduling instead of
+		// turning one stale continuation into a gateway-wide error.
+		slog.Warn("openai_429_guard_account_lookup_failed", "account_id", accountID, "error", err)
+		return nil, false, nil
+	}
+	if account == nil {
+		// The account was removed or is no longer schedulable. Remove the local
+		// tuple so future reconnects do not keep probing a dead socket.
+		s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+		return nil, false, nil
+	}
+	// A guard continuation is deliberately allowed to use a permanently
+	// retained socket after the account's short 429 cooldown. That makes the
+	// account snapshot insufficient here: a proxy edit can otherwise leave the
+	// continuation holding an old Proxy relation and redial through the stale
+	// egress address after the pool was invalidated. Hydrate the account from
+	// the repository before evaluating the continuation and passing it to the
+	// WebSocket forwarder. This rare path prioritizes exact egress identity over
+	// avoiding one database read.
+	if s.accountRepo != nil {
+		latest, latestErr := s.accountRepo.GetByID(ctx, accountID)
+		if latestErr != nil || latest == nil {
+			s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+			return nil, false, nil
+		}
+		account = latest
+	}
+	// A guard tuple is only an escape hatch for the account's confirmed 429
+	// state. A different active runtime block (auth/transport/admin/etc.) must
+	// suppress the tuple even when an old socket pin remains in the pool.
+	blockSnapshot := s.openAIAccountRuntimeBlockSnapshot(account.ID)
+	if blockSnapshot.Active && blockSnapshot.Reason != "429" {
+		return nil, false, nil
+	}
+	if !s.isOpenAIWS429GuardConnectionPinned(account, responseConnID) {
+		// A just-confirmed block may have been recorded before the terminal
+		// response binding was published. Promote the exact bound socket once;
+		// never fall back to another connection for a guard continuation.
+		if !s.isOpenAIWS429GuardConnectionActive(account) {
+			// The runtime block may have expired after this socket was evicted.
+			// Drop only the stale tuple owned by this account/connection so the
+			// ordinary scheduler can choose a healthy account on the next pass.
+			s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+			return nil, false, nil
+		}
+		s.pinOpenAI429GuardConnection(account, responseConnID)
+		if !s.isOpenAIWS429GuardConnectionPinned(account, responseConnID) {
+			s.clearOpenAIWSContinuationBindings(ctx, group, strings.TrimSpace(sessionHash), accountID, responseID, responseConnID)
+			return nil, false, nil
+		}
+	}
+	if !s.isOpenAI429GuardContinuationEligible(ctx, account, responseConnID, groupID, requestedModel, requiredCapability, requireCompact) {
+		return nil, false, nil
+	}
+	if !s.isOpenAI429GuardPooledWSMode(account) {
+		return nil, false, nil
+	}
+	s.pinOpenAI429GuardConnection(account, responseConnID)
+
+	result, acquireErr := s.tryAcquireAccountSlot(ctx, account.ID, account.Concurrency)
+	if acquireErr != nil {
+		return nil, false, acquireErr
+	}
+	if result != nil && result.Acquired {
+		return attachSelectionProfitGate(ctx, &AccountSelectionResult{
+			Account:     account,
+			Acquired:    true,
+			ReleaseFunc: result.ReleaseFunc,
+		}), true, nil
+	}
+	if s.concurrencyService == nil {
+		return nil, false, nil
+	}
+	cfg := s.schedulingConfig()
+	return attachSelectionProfitGate(ctx, &AccountSelectionResult{
+		Account: account,
+		WaitPlan: &AccountWaitPlan{
+			AccountID:      account.ID,
+			MaxConcurrency: account.Concurrency,
+			Timeout:        cfg.StickySessionWaitTimeout,
+			MaxWaiting:     cfg.StickySessionMaxWaiting,
+		},
+	}), true, nil
+}
+
+func (s *OpenAIGatewayService) isOpenAI429GuardContinuationEligible(
+	ctx context.Context,
+	account *Account,
+	connID string,
+	groupID *int64,
+	requestedModel string,
+	requiredCapability OpenAIEndpointCapability,
+	requireCompact bool,
+) bool {
+	if s == nil || account == nil || !account.Codex429GuardEnabled() || !account.IsOpenAIOAuth() ||
+		!account.IsActive() || !account.Schedulable || account.HasFailedHealthProbe() ||
+		!s.isOpenAIWS429GuardConnectionPinned(account, connID) {
+		return false
+	}
+	now := time.Now()
+	if account.AutoPauseOnExpired && account.ExpiresAt != nil && !now.Before(*account.ExpiresAt) {
+		return false
+	}
+	if account.IsOverloaded() || (account.TempUnschedulableUntil != nil && now.Before(*account.TempUnschedulableUntil)) {
+		return false
+	}
+	if !s.openAIAccountMatchesSchedulingGroup(account, groupID) ||
+		(requestedModel != "" && !account.IsModelSupported(requestedModel)) ||
+		!account.SupportsOpenAIEndpointCapability(requiredCapability) ||
+		(requireCompact && openAICompactSupportTier(account) == 0) ||
+		s.isOpenAIAccountModelRuntimeBlocked(account, requestedModel) ||
+		s.isOpenAIAccountBlockedBySchedulingThreshold(ctx, account) ||
+		s.isOpenAIProxyStreamQuarantined(ctx, account) {
+		return false
+	}
+	if paused, _ := shouldAutoPauseOpenAIAccountByQuota(ctx, account); paused {
+		return false
+	}
+	if vetoed, _ := openAIProfitControlVetoReason(ctx, account); vetoed {
+		return false
+	}
+	return true
+}
+
+func (s *OpenAIGatewayService) isOpenAI429GuardPooledWSMode(account *Account) bool {
+	if s == nil || account == nil ||
+		s.getOpenAIWSProtocolResolver().Resolve(account).Transport != OpenAIUpstreamTransportResponsesWebsocketV2 {
+		return false
+	}
+	if s.cfg == nil || !s.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled {
+		return true
+	}
+	switch account.ResolveOpenAIResponsesWebSocketV2Mode(s.cfg.Gateway.OpenAIWS.IngressModeDefault) {
+	case OpenAIWSIngressModeCtxPool, OpenAIWSIngressModeShared:
+		return true
+	default:
+		return false
+	}
 }
 
 func accountSupportsOpenAICapabilities(account *Account, requiredCapability OpenAIEndpointCapability, requiredImageCapability OpenAIImagesCapability) bool {
@@ -2330,7 +2651,10 @@ func (s *OpenAIGatewayService) openAIWSSessionStickyTTL() time.Duration {
 	if s != nil && s.cfg != nil && s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds > 0 {
 		return time.Duration(s.cfg.Gateway.OpenAIWS.StickySessionTTLSeconds) * time.Second
 	}
-	return openaiStickySessionTTL
+	if s != nil {
+		return s.openAIStickySessionIdleTTL(context.Background())
+	}
+	return openaiStickySessionIdleTTLDefault
 }
 
 func (s *OpenAIGatewayService) openAIWSLBTopK() int {
@@ -2355,34 +2679,26 @@ func (s *OpenAIGatewayService) openAIWSLBTopKForRequest(ctx context.Context) int
 }
 
 func (s *OpenAIGatewayService) openAIStickyEscapeConfig() openAIStickyEscapeConfig {
+	// 逃逸是显式 opt-in：默认关闭。TTFT 抖动与账号打满是高并发下的常态，
+	// 自动逃逸会把会话拆到多个账号、优先级来回跳，并直接摧毁上游 prompt
+	// cache 命中。需要时管理员可通过 sticky_escape_enabled + 阈值显式开启。
 	if s != nil && s.cfg != nil {
 		cfg := s.cfg.Gateway.OpenAIScheduler
-		enabled := cfg.StickyEscapeEnabled
-		if !enabled && cfg.StickyEscapeTTFTMs == 0 && cfg.StickyEscapeErrorRate == 0 {
-			enabled = true
-		}
 		ttftMs := float64(cfg.StickyEscapeTTFTMs)
-		if ttftMs <= 0 {
-			ttftMs = 15000
+		if ttftMs < 0 {
+			ttftMs = 0
 		}
 		errorRate := cfg.StickyEscapeErrorRate
 		if errorRate < 0 || errorRate > 1 {
-			errorRate = 0.5
-		}
-		if errorRate == 0 && cfg.StickyEscapeTTFTMs == 0 && cfg.StickyEscapeErrorRate == 0 {
-			errorRate = 0.5
+			errorRate = 0
 		}
 		return openAIStickyEscapeConfig{
-			enabled:   enabled,
+			enabled:   cfg.StickyEscapeEnabled,
 			ttftMs:    ttftMs,
 			errorRate: errorRate,
 		}
 	}
-	return openAIStickyEscapeConfig{
-		enabled:   true,
-		ttftMs:    15000,
-		errorRate: 0.5,
-	}
+	return openAIStickyEscapeConfig{}
 }
 
 func (s *OpenAIGatewayService) openAIWSSchedulerWeights() GatewayOpenAIWSSchedulerScoreWeightsView {

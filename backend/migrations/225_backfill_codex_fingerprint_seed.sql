@@ -1,5 +1,6 @@
--- Backfill system-managed Codex fingerprint seeds for enabled OpenAI OAuth accounts.
--- Idempotent: valid canonical seeds are preserved on rerun.
+-- Codex persists a random installation identity. Backfill one random seed for
+-- each convergence-enabled OpenAI OAuth account instead of deriving externally
+-- visible identities from the deployment-local accounts.id sequence.
 UPDATE accounts
 SET extra = jsonb_set(
     COALESCE(extra, '{}'::jsonb),
@@ -7,15 +8,7 @@ SET extra = jsonb_set(
     to_jsonb(gen_random_uuid()::text),
     true
 )
-WHERE deleted_at IS NULL
-  AND platform = 'openai'
+WHERE platform = 'openai'
   AND type = 'oauth'
-  AND COALESCE(extra->>'codex_fingerprint_mode', '') IN ('device', 'session', 'full')
-  AND (
-      extra->>'codex_fingerprint_seed' IS NULL
-      OR btrim(extra->>'codex_fingerprint_seed') = ''
-      OR NOT (
-          extra->>'codex_fingerprint_seed' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
-          AND extra->>'codex_fingerprint_seed' <> '00000000-0000-0000-0000-000000000000'
-      )
-  );
+  AND extra->>'codex_fingerprint_mode' IN ('device', 'session', 'full')
+  AND NULLIF(BTRIM(extra->>'codex_fingerprint_seed'), '') IS NULL;

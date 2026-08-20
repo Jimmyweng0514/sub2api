@@ -75,9 +75,9 @@ func (s *OpenAIGatewayService) forwardAnthropicViaNativeAnthropicEndpoint(
 		return nil, err
 	}
 
-	proxyURL := ""
-	if account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveConfiguredProxyURL(account)
+	if proxyErr != nil {
+		return nil, s.handleOpenAIUpstreamTransportError(ctx, c, account, proxyErr, true)
 	}
 
 	upstreamCtx, releaseUpstreamCtx := detachStreamUpstreamContext(ctx, clientStream)

@@ -24,7 +24,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuthSuccessPersi
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          1,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -37,7 +37,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuthSuccessPersi
 			"chatgpt_account_id":         "chatgpt-acc",
 			"chatgpt_account_is_fedramp": true,
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -86,7 +86,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuth404MarksUnsu
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          2,
 		Name:        "openai-oauth",
 		Platform:    PlatformOpenAI,
@@ -98,7 +98,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactOAuth404MarksUnsu
 			"access_token":       "oauth-token",
 			"chatgpt_account_id": "chatgpt-acc",
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -130,7 +130,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyUsesNativeR
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          3,
 		Name:        "openai-apikey",
 		Platform:    PlatformOpenAI,
@@ -145,7 +145,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyUsesNativeR
 			// 原生 v2 探测不应用它。
 			"compact_model_mapping": map[string]any{"gpt-5.4": "gpt-5.4-openai-compact"},
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -181,7 +181,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyDefaultBase
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          4,
 		Name:        "openai-apikey-default",
 		Platform:    PlatformOpenAI,
@@ -192,7 +192,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyDefaultBase
 		Credentials: map[string]any{
 			"api_key": "sk-test",
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -218,11 +218,22 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactAPIKeyDefaultBase
 	<-updateCalls
 }
 
+func openAICompactTestAccountWithProxy(account Account) Account {
+	proxyID := int64(7000 + account.ID)
+	account.ProxyID = &proxyID
+	account.Proxy = &Proxy{
+		ID:       proxyID,
+		Protocol: "http",
+		Host:     "127.0.0.1",
+		Port:     1080,
+	}
+	return account
+}
 func TestAccountTestService_TestAccountConnection_OpenAICompact2xxWithoutItemMarksUnsupported(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          5,
 		Name:        "openai-oauth-no-item",
 		Platform:    PlatformOpenAI,
@@ -234,7 +245,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompact2xxWithoutItemMar
 			"access_token":       "oauth-token",
 			"chatgpt_account_id": "chatgpt-acc",
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -271,7 +282,7 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 	gin.SetMode(gin.TestMode)
 
 	updateCalls := make(chan map[string]any, 1)
-	account := Account{
+	account := openAICompactTestAccountWithProxy(Account{
 		ID:          6,
 		Name:        "openai-oauth-identity",
 		Platform:    PlatformOpenAI,
@@ -285,10 +296,10 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 		},
 		// 收敛是显式 opt-in（#5610），这里显式开启以验证探测身份与真实流量同构。
 		Extra: map[string]any{
-			"codex_fingerprint_mode":     "session",
-			codexFingerprintSeedExtraKey: testCodexFingerprintSeed,
+			codexFingerprintModeExtraKey: "device",
+			codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
 		},
-	}
+	})
 	repo := &snapshotUpdateAccountRepo{
 		stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}},
 		updateExtraCalls:      updateCalls,
@@ -306,16 +317,26 @@ func TestAccountTestService_TestAccountConnection_OpenAICompactProbeIdentityMatc
 
 	require.NoError(t, svc.TestAccountConnection(c, account.ID, "gpt-5.4", "", AccountTestModeCompact))
 
-	// 显式 session 收敛模式：出站身份 = 账号级收敛值
-	seed, ok := codexFingerprintSeed(account.Extra)
-	require.True(t, ok)
-	converged := resolveConvergedSessionID(seed)
-	require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
-	require.Equal(t, converged, upstream.lastReq.Header.Get("session_id"))
-	require.Equal(t, resolveConvergedInstallationID(&account, seed), upstream.lastReq.Header.Get("x-codex-installation-id"),
-		"真实 Codex 每个请求必带 installation-id，探测不得缺失")
+	// Compact keeps the probe's real UUIDv7 root session; device convergence
+	// changes only the persisted installation identity.
+	require.NotEmpty(t, upstream.lastReq.Header.Get("session-id"))
+	require.Equal(t, upstream.lastReq.Header.Get("session-id"), upstream.lastReq.Header.Get("session_id"))
+	require.Equal(t, resolveConvergedInstallationID(&account), upstream.lastReq.Header.Get("x-codex-installation-id"),
+		"compact probe must keep the direct installation projection aligned with client_metadata")
+	require.Equal(t, resolveConvergedInstallationID(&account),
+		gjson.GetBytes(upstream.lastBody, "client_metadata.x-codex-installation-id").String())
+	/*
+		// 显式 session 收敛模式：出站身份 = 账号级收敛值
+		seed, ok := codexFingerprintSeed(account.Extra)
+		require.True(t, ok)
+		converged := resolveConvergedSessionID(seed)
+		require.Equal(t, converged, upstream.lastReq.Header.Get("session-id"))
+		require.Equal(t, converged, upstream.lastReq.Header.Get("session_id"))
+		require.Equal(t, resolveConvergedInstallationID(&account, seed), upstream.lastReq.Header.Get("x-codex-installation-id"),
+			"真实 Codex 每个请求必带 installation-id，探测不得缺失")
+	*/
 	require.NotContains(t, upstream.lastReq.Header.Get("session-id"), "probe_compact",
-		"探测标识不得是可被上游一眼识别的字面量")
+		"probe identity must not be a recognizable literal")
 	<-updateCalls
 }
 
@@ -325,6 +346,10 @@ func TestCompactProbeSessionID_IsUUIDShaped(t *testing.T) {
 		_, err := uuid.Parse(got)
 		require.NoError(t, err, "探测会话标识必须是 UUID 形态: %s", got)
 	}
-	require.Equal(t, compactProbeSessionID(7), compactProbeSessionID(7), "同账号应稳定复用同一会话")
-	require.NotEqual(t, compactProbeSessionID(7), compactProbeSessionID(8))
+	first := compactProbeSessionID(7)
+	second := compactProbeSessionID(7)
+	parsed, err := uuid.Parse(first)
+	require.NoError(t, err)
+	require.Equal(t, uuid.Version(7), parsed.Version())
+	require.NotEqual(t, first, second, "每次探测应创建独立的 UUIDv7 根回合")
 }

@@ -1,5 +1,5 @@
 /**
- * Core Type Definitions for Sub2API Frontend
+ * Core Type Definitions for Sub2API Plus Frontend
  */
 
 // ==================== Common Types ====================
@@ -1131,7 +1131,23 @@ export interface Account {
     upstream_billing_probe?: UpstreamBillingProbeSnapshot
     codex_reset_credit_snapshot?: {
       available_count?: number
+      applicable_available_count?: number
       credits?: { expires_at?: string }[]
+    }
+    codex_credit_snapshot?: {
+      balance?: string
+      has_credits?: boolean
+      unlimited?: boolean
+      overage_limit_reached?: boolean
+      updated_at?: string
+    }
+    openai_codex_429_guard_enabled?: boolean
+    account_health_probe?: {
+      status: 'healthy' | 'failed'
+      mode: 'openai_oauth_quota' | 'openai_apikey_connection'
+      attempts: number
+      checked_at: string
+      reason?: string
     }
   } & Record<string, unknown>)
   proxy_id: number | null
@@ -1426,6 +1442,7 @@ export interface CreateAccountRequest {
   auto_pause_on_expired?: boolean
   upstream_billing_probe_enabled?: boolean
   confirm_mixed_channel_risk?: boolean
+  confirm_overages_risk?: boolean
 }
 
 export interface UpdateAccountRequest {
@@ -1434,6 +1451,7 @@ export interface UpdateAccountRequest {
   type?: AccountType
   credentials?: Record<string, unknown>
   extra?: Record<string, unknown>
+  codex_fingerprint_mode_touched?: boolean
   proxy_id?: number | null
   concurrency?: number
   load_factor?: number | null
@@ -1447,6 +1465,7 @@ export interface UpdateAccountRequest {
   upstream_billing_probe_enabled?: boolean
   upstream_billing_rate_sync_enabled?: boolean
   confirm_mixed_channel_risk?: boolean
+  confirm_overages_risk?: boolean
 }
 
 export interface CheckMixedChannelRequest {
@@ -1515,6 +1534,11 @@ export interface AdminDataProxy {
   username?: string | null
   password?: string | null
   status: 'active' | 'inactive'
+  expires_at?: number | null
+  fallback_mode?: 'none' | 'proxy' | 'direct'
+  backup_proxy_name?: string
+  backup_proxy_key?: string
+  expiry_warn_days?: number
 }
 
 export interface AdminDataAccount {

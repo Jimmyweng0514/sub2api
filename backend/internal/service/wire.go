@@ -28,8 +28,9 @@ func ProvideGrokOAuthService(proxyRepo ProxyRepository, oauthClient GrokOAuthCli
 
 // BuildInfo contains build information
 type BuildInfo struct {
-	Version   string
-	BuildType string
+	Version    string
+	BuildType  string
+	UpdateRepo string
 }
 
 // ProvidePricingService creates and initializes PricingService
@@ -44,7 +45,7 @@ func ProvidePricingService(cfg *config.Config, remoteClient PricingRemoteClient)
 
 // ProvideUpdateService creates UpdateService with BuildInfo
 func ProvideUpdateService(cache UpdateCache, githubClient GitHubReleaseClient, buildInfo BuildInfo) *UpdateService {
-	return NewUpdateService(cache, githubClient, buildInfo.Version, buildInfo.BuildType)
+	return NewUpdateService(cache, githubClient, buildInfo.Version, buildInfo.BuildType, buildInfo.UpdateRepo)
 }
 
 // ProvideEmailQueueService creates EmailQueueService with default worker count
@@ -230,7 +231,9 @@ func ProvideAccountTestService(
 	cfg *config.Config,
 	tlsFPProfileService *TLSFingerprintProfileService,
 	openAIGatewayService *OpenAIGatewayService,
+	rateLimitService *RateLimitService,
 	settingService *SettingService,
+	openAIQuotaService *OpenAIQuotaService,
 ) *AccountTestService {
 	service := NewAccountTestService(
 		accountRepo,
@@ -243,7 +246,9 @@ func ProvideAccountTestService(
 		tlsFPProfileService,
 	)
 	service.agentIdentityWS = openAIGatewayService
+	service.SetRateLimitService(rateLimitService)
 	service.SetSettingService(settingService)
+	service.SetOpenAIQuotaService(openAIQuotaService)
 	return service
 }
 
@@ -368,8 +373,8 @@ func ProvideAccountExpiryService(accountRepo AccountRepository) *AccountExpirySe
 	return svc
 }
 
-// ProvideOpenAICodexVersionSyncService creates and starts OpenAICodexVersionSyncService.
-// 出站 Codex 身份的版本号靠它跟随官方发布，无需为了跟版本而发新版本；面板可关闭。
+// ProvideOpenAICodexVersionSyncService creates and starts the Codex version
+// synchronizer used by the outbound identity builder.
 func ProvideOpenAICodexVersionSyncService(
 	settingRepo SettingRepository,
 	settingService *SettingService,
@@ -457,12 +462,14 @@ func ProvideRateLimitService(
 	geminiQuotaService *GeminiQuotaService,
 	tempUnschedCache TempUnschedCache,
 	timeoutCounterCache TimeoutCounterCache,
+	openAI429CounterCache OpenAI429CounterCache,
 	openAI403CounterCache OpenAI403CounterCache,
 	settingService *SettingService,
 	tokenCacheInvalidator TokenCacheInvalidator,
 ) *RateLimitService {
 	svc := NewRateLimitService(accountRepo, usageRepo, cfg, geminiQuotaService, tempUnschedCache)
 	svc.SetTimeoutCounterCache(timeoutCounterCache)
+	svc.SetOpenAI429CounterCache(openAI429CounterCache)
 	svc.SetOpenAI403CounterCache(openAI403CounterCache)
 	svc.SetSettingService(settingService)
 	svc.SetTokenCacheInvalidator(tokenCacheInvalidator)
@@ -746,8 +753,6 @@ func ProvideSettingService(settingRepo SettingRepository, groupRepo GroupReposit
 		logger.LegacyPrintf("service.setting", "Warning: migrate codex body fingerprint to signals failed: %v", err)
 	}
 	antigravity.SetUserAgentVersionResolver(svc.GetAntigravityUserAgentVersion)
-	// enforceCodexIdentityHeaders 是所有 Codex 出站路径共用的纯函数收口点，拿不到 ctx，
-	// 故注入无参解析器；解析器内部自带 60s TTL 缓存，热路径不触库。
 	SetCodexCanonicalUserAgentResolver(func() string {
 		return svc.GetOpenAICodexCanonicalUserAgent(context.Background())
 	})

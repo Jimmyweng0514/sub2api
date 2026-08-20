@@ -66,6 +66,12 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 		return nil
 	}
 
+	proxyURL, proxyErr := resolveRequiredOpenAIProxyURL(account)
+	if proxyErr != nil {
+		writeOpenAIResponsesInputTokensError(c, http.StatusBadGateway, "upstream_error", "Configured account proxy is unavailable")
+		return fmt.Errorf("responses input_tokens: resolve upstream proxy: %w", proxyErr)
+	}
+
 	token, _, err := s.GetAccessToken(ctx, account)
 	if err != nil {
 		writeOpenAIResponsesInputTokensError(c, http.StatusBadGateway, "upstream_error", "Failed to get access token")
@@ -79,10 +85,6 @@ func (s *OpenAIGatewayService) ForwardResponsesInputTokens(
 		return fmt.Errorf("responses input_tokens: build upstream request: %w", err)
 	}
 
-	proxyURL := ""
-	if account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
-	}
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 	if err != nil {
 		safeErr := sanitizeUpstreamErrorMessage(err.Error())
@@ -319,9 +321,10 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 		return fmt.Errorf("build input_tokens request: %w", err)
 	}
 
-	proxyURL := ""
-	if account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := resolveRequiredOpenAIProxyURL(account)
+	if proxyErr != nil {
+		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Configured account proxy is unavailable")
+		return fmt.Errorf("resolve upstream proxy: %w", proxyErr)
 	}
 	resp, err := s.httpUpstream.Do(upstreamReq, proxyURL, account.ID, account.Concurrency)
 	if err != nil {
@@ -345,9 +348,7 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 			return nil
 		}
 
-		if s.rateLimitService != nil {
-			s.rateLimitService.HandleUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody)
-		}
+		s.handleOpenAIAccountUpstreamError(ctx, account, resp.StatusCode, resp.Header, respBody, prepared.UpstreamModel)
 
 		if isOpenAIInputTokensUnsupported(resp.StatusCode, respBody) {
 			writeAnthropicCountTokensError(c, http.StatusNotFound, "not_found_error", "Token counting is not supported by upstream")
@@ -383,6 +384,7 @@ func (s *OpenAIGatewayService) ForwardCountTokensAsAnthropic(
 		writeAnthropicCountTokensError(c, http.StatusBadGateway, "upstream_error", "Upstream response missing input_tokens")
 		return fmt.Errorf("input_tokens response missing input_tokens field")
 	}
+	s.clearOpenAIOAuth429Streak(account.ID)
 
 	c.JSON(http.StatusOK, gin.H{
 		"input_tokens": int(inputTokens.Int()),
@@ -443,7 +445,6 @@ func (s *OpenAIGatewayService) buildInputTokensUpstreamRequest(
 			targetURL = buildOpenAIResponsesInputTokensURL(validatedURL)
 		}
 	}
-
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, targetURL, bytes.NewReader(body))
 	if err != nil {
 		return nil, err

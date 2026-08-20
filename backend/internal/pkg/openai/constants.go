@@ -45,7 +45,9 @@ func DefaultModelIDs() []string {
 // DefaultTestModel default model for testing OpenAI accounts
 const DefaultTestModel = "gpt-5.4"
 
-// CodexUsageProbeModel is the model used for OAuth Codex usage probes.
+// CodexUsageProbeModel is the model used for OAuth Codex usage probes. It is
+// intentionally a Codex-compatible alias rather than a chat model so the
+// upstream quota endpoint returns the same weekly windows as the real CLI.
 const CodexUsageProbeModel = "codex-auto-review"
 
 // DefaultInstructions default instructions for non-Codex CLI requests.

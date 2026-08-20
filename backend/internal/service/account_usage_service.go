@@ -719,6 +719,7 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 	applyExtraToUsage(usage, account.Extra, now)
 
 	if (force || shouldRefreshOpenAICodexSnapshot(account, usage, now)) && s.shouldProbeOpenAICodexSnapshot(account.ID, now, force) {
+		probeSucceeded := false
 		if account.IsShadow() {
 			// Spark shadow accounts fetch usage from /wham/usage (bengalfox channel)
 			// via the shared OpenAIQuotaService, which resolves credentials from the
@@ -727,13 +728,29 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 			if s.openAIQuotaService != nil {
 				if quotaUsage, err := s.openAIQuotaService.QueryUsage(ctx, account.ID); err == nil {
 					if updates := buildCodexSparkWindowExtraUpdates(quotaUsage, now); len(updates) > 0 {
-						mergeAccountExtra(account, updates)
-						s.persistOpenAICodexProbeSnapshot(account.ID, updates)
-						if usage.UpdatedAt == nil {
-							usage.UpdatedAt = &now
+						if persistErr := s.persistOpenAICodexProbeSnapshot(ctx, account.ID, updates); persistErr == nil {
+							mergeAccountExtra(account, updates)
+							if usage.UpdatedAt == nil {
+								usage.UpdatedAt = &now
+							}
+							applyExtraToUsage(usage, account.Extra, now)
+							probeSucceeded = true
 						}
-						applyExtraToUsage(usage, account.Extra, now)
+					} else {
+						probeSucceeded = true
 					}
+				}
+			}
+		} else if s.openAIQuotaService != nil {
+			if quotaUsage, err := s.openAIQuotaService.QueryUsage(ctx, account.ID); err == nil {
+				if cacheErr := s.openAIQuotaService.CacheUsageSnapshot(ctx, account.ID, quotaUsage); cacheErr == nil {
+					updates := buildOpenAIQuotaExtraUpdates(account, quotaUsage, now)
+					mergeAccountExtra(account, updates)
+					if usage.UpdatedAt == nil {
+						usage.UpdatedAt = &now
+					}
+					applyExtraToUsage(usage, account.Extra, now)
+					probeSucceeded = true
 				}
 			}
 		} else {
@@ -743,7 +760,13 @@ func (s *AccountUsageService) getOpenAIUsage(ctx context.Context, account *Accou
 					usage.UpdatedAt = &now
 				}
 				applyExtraToUsage(usage, account.Extra, now)
+				probeSucceeded = true
+			} else if err == nil {
+				probeSucceeded = true
 			}
+		}
+		if !probeSucceeded {
+			s.releaseOpenAICodexProbe(account.ID, now)
 		}
 	}
 
@@ -772,6 +795,11 @@ func shouldRefreshOpenAICodexSnapshot(account *Account, usage *UsageInfo, now ti
 	if account == nil {
 		return false
 	}
+	if account.IsOpenAIOAuth() && !account.IsShadow() && account.QuotaDimensionOrDefault() != QuotaDimensionSpark {
+		if _, ok := account.Extra[openaiQuotaCreditBalanceKey]; !ok {
+			return true
+		}
+	}
 	if usage == nil {
 		return true
 	}
@@ -792,9 +820,6 @@ func isOpenAICodexSnapshotStale(account *Account, now time.Time) bool {
 	// (/wham/usage body 的 codex_bengalfox),与 WSv2 无关——不能用 WSv2 门控其 staleness,否则首刷后
 	// codex_5h/7d 已存在→staleness 恒 false→spark 窗口永久冻结(外审第9轮 P1)。影子改按
 	// codex_usage_updated_at TTL 判定;实际查询频率仍由 shouldProbeOpenAICodexSnapshot 的缓存 TTL 节流。
-	if !account.IsShadow() && !account.IsOpenAIResponsesWebSocketV2Enabled() {
-		return false
-	}
 	if account.Extra == nil {
 		return true
 	}
@@ -814,15 +839,29 @@ func (s *AccountUsageService) shouldProbeOpenAICodexSnapshot(accountID int64, no
 		return true
 	}
 	forceProbe := len(force) > 0 && force[0]
-	if !forceProbe {
-		if cached, ok := s.cache.openAIProbeCache.Load(accountID); ok {
-			if ts, ok := cached.(time.Time); ok && now.Sub(ts) < openAIProbeCacheTTL {
-				return false
-			}
+	if forceProbe {
+		s.cache.openAIProbeCache.Store(accountID, now)
+		return true
+	}
+	for {
+		cached, loaded := s.cache.openAIProbeCache.LoadOrStore(accountID, now)
+		if !loaded {
+			return true
+		}
+		if ts, ok := cached.(time.Time); ok && now.Sub(ts) < openAIProbeCacheTTL {
+			return false
+		}
+		if s.cache.openAIProbeCache.CompareAndSwap(accountID, cached, now) {
+			return true
 		}
 	}
-	s.cache.openAIProbeCache.Store(accountID, now)
-	return true
+}
+
+func (s *AccountUsageService) releaseOpenAICodexProbe(accountID int64, reservation time.Time) {
+	if s == nil || s.cache == nil || accountID <= 0 {
+		return
+	}
+	s.cache.openAIProbeCache.CompareAndDelete(accountID, reservation)
 }
 
 func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, account *Account) (map[string]any, error) {
@@ -875,15 +914,12 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 			req.Header.Set("User-Agent", strings.TrimSpace(fp.UserAgent))
 		}
 	}
-	// 与真实转发一致：账号级自定义 UA 同样作为管理员显式配置传入。
-	// 上面写进 header 的指纹缓存 UA 只在强制统一被关闭时才参与配对（保持回滚后的历史语义）；
-	// 强制统一开启时客户端身份不参与构造，探针与真实转发用同一套规范身份出站。
 	enforceCodexIdentityHeadersWithUA(req.Header, account.GetOpenAIUserAgent())
 	setOpenAIChatGPTAccountHeaders(req.Header, account)
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, err := resolveRequiredOpenAIProxyURL(account)
+	if err != nil {
+		return nil, fmt.Errorf("resolve openai probe proxy: %w", err)
 	}
 	client, err := httppool.GetClient(httppool.Options{
 		ProxyURL:              proxyURL,
@@ -904,25 +940,25 @@ func (s *AccountUsageService) probeOpenAICodexSnapshot(ctx context.Context, acco
 		return nil, err
 	}
 	if len(updates) > 0 {
-		s.persistOpenAICodexProbeSnapshot(account.ID, updates)
+		if err := s.persistOpenAICodexProbeSnapshot(reqCtx, account.ID, updates); err != nil {
+			return nil, err
+		}
 		return updates, nil
 	}
 	return nil, nil
 }
 
-func (s *AccountUsageService) persistOpenAICodexProbeSnapshot(accountID int64, updates map[string]any) {
+func (s *AccountUsageService) persistOpenAICodexProbeSnapshot(ctx context.Context, accountID int64, updates map[string]any) error {
 	if s == nil || s.accountRepo == nil || accountID <= 0 {
-		return
+		return fmt.Errorf("openai codex snapshot repository is unavailable")
 	}
 	if len(updates) == 0 {
-		return
+		return nil
 	}
-
-	go func() {
-		updateCtx, updateCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer updateCancel()
-		_ = s.accountRepo.UpdateExtra(updateCtx, accountID, updates)
-	}()
+	if err := s.accountRepo.UpdateExtra(ctx, accountID, updates); err != nil {
+		return fmt.Errorf("persist openai codex snapshot: %w", err)
+	}
+	return nil
 }
 
 func extractOpenAICodexProbeUpdates(resp *http.Response) (map[string]any, error) {

@@ -167,7 +167,8 @@ type AccountBulkUpdate struct {
 	Extra          map[string]any
 	ProbeEnabled   *bool
 	// EnsureCodexFingerprintSeed asks the repository to atomically preserve an
-	// existing valid Codex fingerprint seed or create one for eligible rows.
+	// existing valid Codex fingerprint seed or create one per eligible OpenAI
+	// OAuth row inside the same bulk transaction.
 	EnsureCodexFingerprintSeed bool
 }
 
@@ -189,17 +190,20 @@ type CreateAccountRequest struct {
 
 // UpdateAccountRequest 更新账号请求
 type UpdateAccountRequest struct {
-	Name               *string         `json:"name"`
-	Notes              *string         `json:"notes"`
-	Credentials        *map[string]any `json:"credentials"`
-	Extra              *map[string]any `json:"extra"`
-	ProxyID            *int64          `json:"proxy_id"`
-	Concurrency        *int            `json:"concurrency"`
-	Priority           *int            `json:"priority"`
-	Status             *string         `json:"status"`
-	GroupIDs           *[]int64        `json:"group_ids"`
-	ExpiresAt          *time.Time      `json:"expires_at"`
-	AutoPauseOnExpired *bool           `json:"auto_pause_on_expired"`
+	Name        *string         `json:"name"`
+	Notes       *string         `json:"notes"`
+	Credentials *map[string]any `json:"credentials"`
+	Extra       *map[string]any `json:"extra"`
+	// Set only when the fingerprint mode selector was deliberately changed.
+	// A full extra snapshot may include the current mode during unrelated edits.
+	CodexFingerprintModeTouched *bool      `json:"codex_fingerprint_mode_touched"`
+	ProxyID                     *int64     `json:"proxy_id"`
+	Concurrency                 *int       `json:"concurrency"`
+	Priority                    *int       `json:"priority"`
+	Status                      *string    `json:"status"`
+	GroupIDs                    *[]int64   `json:"group_ids"`
+	ExpiresAt                   *time.Time `json:"expires_at"`
+	AutoPauseOnExpired          *bool      `json:"auto_pause_on_expired"`
 }
 
 // AccountService 账号管理服务
@@ -222,6 +226,9 @@ func NewAccountService(accountRepo AccountRepository, groupRepo GroupRepository)
 
 // Create 创建账号
 func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (*Account, error) {
+	if err := ValidateCodexFingerprintExtra(req.Platform, req.Type, req.Extra); err != nil {
+		return nil, err
+	}
 	// 验证分组是否存在（如果指定了分组）
 	if len(req.GroupIDs) > 0 {
 		if err := s.validateGroupIDsExist(ctx, req.GroupIDs); err != nil {
@@ -236,7 +243,9 @@ func (s *AccountService) Create(ctx context.Context, req CreateAccountRequest) (
 		Platform:    req.Platform,
 		Type:        req.Type,
 		Credentials: SanitizeStoredCredentials(req.Platform, req.Credentials),
-		Extra:       prepareCodexFingerprintExtraForCreate(req.Platform, req.Type, req.Extra),
+		// The normalizer discards an external seed and mints a server-owned
+		// identity when an OAuth convergence mode is enabled.
+		Extra:       NormalizeCodexFingerprintExtraForAccount(req.Platform, req.Type, req.Extra),
 		ProxyID:     req.ProxyID,
 		Concurrency: req.Concurrency,
 		Priority:    req.Priority,
@@ -331,7 +340,16 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 		account.Credentials = SanitizeStoredCredentials(account.Platform, *req.Credentials)
 	}
 
+	explicitCodexFingerprintModeEdit := req.CodexFingerprintModeTouched != nil && *req.CodexFingerprintModeTouched
+	if !explicitCodexFingerprintModeEdit && req.CodexFingerprintModeTouched == nil && req.Extra != nil {
+		if value, present := (*req.Extra)[codexFingerprintModeExtraKey]; present && value == nil {
+			explicitCodexFingerprintModeEdit = true
+		}
+	}
 	if req.Extra != nil {
+		if err := ValidateCodexFingerprintExtra(account.Platform, account.Type, *req.Extra); err != nil {
+			return nil, err
+		}
 		extra := make(map[string]any, len(*req.Extra))
 		for key, value := range *req.Extra {
 			extra[key] = value
@@ -339,9 +357,12 @@ func (s *AccountService) Update(ctx context.Context, id int64, req UpdateAccount
 		delete(extra, OllamaCloudUsageSessionExtraKey)
 		delete(extra, OllamaCloudUsageAutoRefreshExtraKey)
 		delete(extra, OllamaCloudUsageSnapshotExtraKey)
-		account.Extra = prepareCodexFingerprintExtraForUpdate(account, extra)
+		account.Extra = NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
+		if explicitCodexFingerprintModeEdit {
+			account.Extra = AcknowledgeCodexFingerprintModeEdit(account.Extra)
+		}
 	} else {
-		account.Extra = prepareCodexFingerprintExtraForUpdate(account, account.Extra)
+		account.Extra = NormalizeCodexFingerprintExtraForExistingAccount(account, account.Extra)
 	}
 
 	if req.ProxyID != nil {

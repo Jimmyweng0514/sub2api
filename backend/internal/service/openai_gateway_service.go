@@ -30,9 +30,9 @@ const (
 	// ChatGPT internal API for OAuth accounts
 	chatgptCodexURL = "https://chatgpt.com/backend-api/codex/responses"
 	// OpenAI Platform API for API Key accounts (fallback)
-	openaiPlatformAPIURL            = "https://api.openai.com/v1/responses"
-	openaiPlatformAPIInputTokensURL = "https://api.openai.com/v1/responses/input_tokens"
-	openaiStickySessionTTL          = time.Hour // 粘性会话TTL
+	openaiPlatformAPIURL              = "https://api.openai.com/v1/responses"
+	openaiPlatformAPIInputTokensURL   = "https://api.openai.com/v1/responses/input_tokens"
+	openaiStickySessionIdleTTLDefault = 60 * time.Second // 粘性会话空闲租约默认值；运行时可经设置键调整
 	// 与真实 Codex TUI 的 User-Agent 结构对齐：
 	// {originator}/{version} ({OS} {OS_version}; {arch}) {terminal}
 	// 缺少 OS/架构/终端后缀的形态易被上游指纹识别为非官方客户端。
@@ -72,39 +72,102 @@ const (
 
 // OpenAI allowed headers whitelist (for non-passthrough).
 var openaiAllowedHeaders = map[string]bool{
-	"accept-language":         true,
-	"content-type":            true,
-	"conversation_id":         true,
-	"user-agent":              true,
-	"originator":              true,
-	"session_id":              true,
-	"x-codex-beta-features":   true,
-	"x-codex-installation-id": true,
-	"x-codex-turn-state":      true,
-	"x-codex-turn-metadata":   true,
-	"x-codex-window-id":       true,
-	responsesLiteHeaderKey:    true,
+	"accept":                                true,
+	"accept-language":                       true,
+	"content-type":                          true,
+	"conversation_id":                       true,
+	"openai-beta":                           true,
+	"user-agent":                            true,
+	"originator":                            true,
+	"version":                               true,
+	"session-id":                            true,
+	"session_id":                            true,
+	"thread-id":                             true,
+	"thread_id":                             true,
+	"x-client-request-id":                   true,
+	"x-codex-beta-features":                 true,
+	"x-codex-installation-id":               true,
+	"x-codex-inference-call-id":             true,
+	"x-codex-routing-hint":                  true,
+	"x-codex-turn-state":                    true,
+	"x-codex-turn-metadata":                 true,
+	"x-codex-window-id":                     true,
+	"x-codex-parent-thread-id":              true,
+	"x-oai-attestation":                     true,
+	"x-openai-internal-codex-residency":     true,
+	"x-openai-memgen-request":               true,
+	"x-openai-subagent":                     true,
+	"x-responsesapi-include-timing-metrics": true,
+	responsesLiteHeaderKey:                  true,
 }
 
 // OpenAI passthrough allowed headers whitelist.
 // 透传模式下仅放行这些低风险请求头，避免将非标准/环境噪声头传给上游触发风控。
 var openaiPassthroughAllowedHeaders = map[string]bool{
-	"accept":                  true,
-	"accept-language":         true,
-	"content-type":            true,
-	"conversation_id":         true,
-	"openai-beta":             true,
-	"user-agent":              true,
-	"originator":              true,
-	"session_id":              true,
-	"x-codex-beta-features":   true,
-	"x-codex-installation-id": true,
-	"x-codex-turn-state":      true,
-	"x-codex-turn-metadata":   true,
-	"x-codex-window-id":       true,
-	responsesLiteHeaderKey:    true,
+	"accept":                                true,
+	"accept-language":                       true,
+	"content-type":                          true,
+	"conversation_id":                       true,
+	"openai-beta":                           true,
+	"user-agent":                            true,
+	"originator":                            true,
+	"version":                               true,
+	"session-id":                            true,
+	"session_id":                            true,
+	"thread-id":                             true,
+	"thread_id":                             true,
+	"x-client-request-id":                   true,
+	"x-codex-beta-features":                 true,
+	"x-codex-installation-id":               true,
+	"x-codex-inference-call-id":             true,
+	"x-codex-routing-hint":                  true,
+	"x-codex-turn-state":                    true,
+	"x-codex-turn-metadata":                 true,
+	"x-codex-window-id":                     true,
+	"x-codex-parent-thread-id":              true,
+	"x-oai-attestation":                     true,
+	"x-openai-internal-codex-residency":     true,
+	"x-openai-memgen-request":               true,
+	"x-openai-subagent":                     true,
+	"x-responsesapi-include-timing-metrics": true,
+	responsesLiteHeaderKey:                  true,
 }
 
+// openaiOfficialCodexIdentityHeaders is the subset of Codex client headers
+// that may be carried through unchanged when a request contains a genuine
+// official-client identity.  Authentication and account-routing headers are
+// intentionally excluded; those are owned by the selected upstream account.
+var openaiOfficialCodexIdentityHeaders = map[string]bool{
+	"accept-language":                        true,
+	"openai-beta":                            true,
+	"user-agent":                             true,
+	"originator":                             true,
+	"version":                                true,
+	"session-id":                             true,
+	"session_id":                             true,
+	"thread-id":                              true,
+	"thread_id":                              true,
+	"x-client-request-id":                    true,
+	"x-codex-beta-features":                  true,
+	"x-codex-installation-id":                true,
+	"x-codex-inference-call-id":              true,
+	"x-codex-parent-thread-id":               true,
+	"x-codex-routing-hint":                   true,
+	"x-codex-turn-metadata":                  true,
+	"x-codex-turn-state":                     true,
+	"x-codex-window-id":                      true,
+	"x-oai-attestation":                      true,
+	"x-openai-internal-codex-residency":      true,
+	"x-openai-internal-codex-responses-lite": true,
+	"x-openai-memgen-request":                true,
+	"x-openai-subagent":                      true,
+	"x-responsesapi-include-timing-metrics":  true,
+}
+
+// copyOpenAIOfficialCodexIdentityHeaders copies only the identity/transport
+// headers that the official Codex client itself may emit. It deliberately
+// excludes credentials and proxy metadata, which must be rebuilt for the
+// selected account and network route.
 // codex_cli_only 拒绝时记录的请求头白名单（仅用于诊断日志，不参与上游透传）
 var codexCLIOnlyDebugHeaderWhitelist = []string{
 	"User-Agent",
@@ -287,6 +350,10 @@ type OpenAIForwardResult struct {
 	wsReplayInput                []json.RawMessage
 	wsReplayInputExists          bool
 	wsAccountFailoverReplayInput []json.RawMessage
+	// wsConnectionBroken records a terminal upstream failure that was already
+	// visible to the client. Ingress must close rather than reuse the same
+	// client session, because replaying a partially visible turn is unsafe.
+	wsConnectionBroken bool
 }
 
 // SucceededForScheduling reports whether this result is an upstream success
@@ -434,6 +501,7 @@ type OpenAIGatewayService struct {
 	liveAttestationCipher SecretEncryptor
 
 	openaiWSPoolOnce               sync.Once
+	openaiWSPoolRef                atomic.Pointer[openAIWSConnPool]
 	openaiWSStateStoreOnce         sync.Once
 	openaiSchedulerOnce            sync.Once
 	openaiProxyStreamCircuitOnce   sync.Once
@@ -451,12 +519,14 @@ type OpenAIGatewayService struct {
 
 	openaiWSFallbackUntil               sync.Map // key: int64(accountID), value: time.Time
 	openaiAccountRuntimeBlockUntil      sync.Map // key: int64(accountID), value: time.Time
+	openaiAccountRuntimeBlockReason     sync.Map // key: int64(accountID), value: string
 	openaiAccountRuntimeBlockLocks      sync.Map // key: int64(accountID), value: *sync.Mutex
 	openaiAccountRuntimeBlockGeneration sync.Map // key: int64(accountID), value: uint64
 	openaiAccountRuntimeBlockSequence   atomic.Uint64
 	grokCredentialMutationLocks         sync.Map // key: int64(accountID), value: *sync.Mutex
 	openaiOAuth429WindowStartUnixNano   atomic.Int64
 	openaiOAuth429WindowCount           atomic.Int64
+	openaiOAuth429Streak                sync.Map // key: int64(accountID), value: openAIOAuth429StreakState
 	openaiWSRetryMetrics                openAIWSRetryMetrics
 	responseHeaderFilter                *responseheaders.CompiledHeaderFilter
 	codexSnapshotThrottle               *accountWriteThrottle
@@ -663,6 +733,14 @@ func (s *OpenAIGatewayService) CloseOpenAIWSPool() {
 }
 
 func (s *OpenAIGatewayService) InvalidateAgentIdentityWSConnections(accountID int64) {
+	s.InvalidateOpenAIWSConnections(accountID)
+}
+
+// InvalidateOpenAIWSConnections closes every pooled upstream socket for an
+// account. Account proxy/credential changes must invalidate a live guard pin
+// immediately; otherwise a long-lived old WebSocket could bypass the newly
+// configured egress proxy until its natural failure.
+func (s *OpenAIGatewayService) InvalidateOpenAIWSConnections(accountID int64) {
 	if pool := s.getOpenAIWSConnPool(); pool != nil {
 		pool.ClearAccount(accountID)
 	}

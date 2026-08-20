@@ -204,3 +204,141 @@ func TestReconcileCRSUpstreamBillingProbeExtra(t *testing.T) {
 		})
 	}
 }
+
+func TestScrubCRSOpenAIOAuthOnlyExtra(t *testing.T) {
+	keys := []string{
+		codexFingerprintModeExtraKey,
+		codexFingerprintSeedExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+		OpenAICodex429GuardEnabledExtraKey,
+	}
+	for _, target := range []struct {
+		name     string
+		platform string
+		kind     string
+		keep     bool
+	}{
+		{name: "openai oauth", platform: PlatformOpenAI, kind: AccountTypeOAuth, keep: true},
+		{name: "openai api key", platform: PlatformOpenAI, kind: AccountTypeAPIKey},
+		{name: "openai setup token", platform: PlatformOpenAI, kind: AccountTypeSetupToken},
+		{name: "anthropic oauth", platform: PlatformAnthropic, kind: AccountTypeOAuth},
+	} {
+		t.Run(target.name, func(t *testing.T) {
+			extra := map[string]any{
+				codexFingerprintModeExtraKey:       "device",
+				codexFingerprintSeedExtraKey:       "11111111-1111-4111-8111-111111111111",
+				"openai_device_id":                 "device",
+				"openai_session_id":                "session",
+				OpenAICodex429GuardEnabledExtraKey: true,
+				"keep":                             "value",
+			}
+			scrubCRSOpenAIOAuthOnlyExtra(target.platform, target.kind, extra)
+			for _, key := range keys {
+				if target.keep {
+					require.Contains(t, extra, key)
+				} else {
+					require.NotContains(t, extra, key)
+				}
+			}
+			require.Equal(t, "value", extra["keep"])
+		})
+	}
+}
+
+func TestNormalizeCRSOpenAICodexFingerprintExtraScrubsShadowIdentity(t *testing.T) {
+	parentID := int64(7)
+	shadow := &Account{
+		Platform:        PlatformOpenAI,
+		Type:            AccountTypeOAuth,
+		ParentAccountID: &parentID,
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey:       "device",
+			codexFingerprintSeedExtraKey:       "11111111-1111-4111-8111-111111111111",
+			"openai_device_id":                 "legacy-device",
+			"openai_session_id":                "legacy-session",
+			OpenAICodex429GuardEnabledExtraKey: true,
+		},
+	}
+	extra := mergeMap(shadow.Extra, map[string]any{"keep": "value"})
+	got := normalizeCRSOpenAICodexFingerprintExtra(shadow, extra)
+	for _, key := range []string{
+		codexFingerprintModeExtraKey,
+		codexFingerprintSeedExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+		OpenAICodex429GuardEnabledExtraKey,
+	} {
+		require.NotContains(t, got, key)
+	}
+	require.Equal(t, "value", got["keep"])
+}
+
+func TestNormalizeCRSOpenAICodexFingerprintExtraDoesNotTrustIncomingSeed(t *testing.T) {
+	remoteSeed := "22222222-2222-4222-8222-222222222222"
+
+	t.Run("new enabled account generates a local seed", func(t *testing.T) {
+		got := normalizeCRSOpenAICodexFingerprintExtra(nil, map[string]any{
+			codexFingerprintModeExtraKey: string(codexFingerprintFull),
+			codexFingerprintSeedExtraKey: remoteSeed,
+			"keep":                       "value",
+		})
+
+		require.Equal(t, string(codexFingerprintFull), got[codexFingerprintModeExtraKey])
+		seed, ok := got[codexFingerprintSeedExtraKey].(string)
+		require.True(t, ok)
+		require.NotEqual(t, remoteSeed, seed)
+		require.True(t, isCodexFingerprintSeed(seed))
+		require.Equal(t, "value", got["keep"])
+	})
+
+	t.Run("new off account does not receive a seed", func(t *testing.T) {
+		got := normalizeCRSOpenAICodexFingerprintExtra(nil, map[string]any{
+			codexFingerprintModeExtraKey: string(codexFingerprintOff),
+			codexFingerprintSeedExtraKey: remoteSeed,
+		})
+
+		require.Equal(t, string(codexFingerprintOff), got[codexFingerprintModeExtraKey])
+		require.NotContains(t, got, codexFingerprintSeedExtraKey)
+	})
+
+	t.Run("existing account keeps its local seed", func(t *testing.T) {
+		localSeed := "11111111-1111-4111-8111-111111111111"
+		existing := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeOAuth,
+			Extra: map[string]any{
+				codexFingerprintModeExtraKey: string(codexFingerprintDevice),
+				codexFingerprintSeedExtraKey: localSeed,
+			},
+		}
+
+		got := normalizeCRSOpenAICodexFingerprintExtra(existing, map[string]any{
+			codexFingerprintModeExtraKey: string(codexFingerprintSession),
+			codexFingerprintSeedExtraKey: remoteSeed,
+		})
+
+		require.Equal(t, string(codexFingerprintSession), got[codexFingerprintModeExtraKey])
+		require.Equal(t, localSeed, got[codexFingerprintSeedExtraKey])
+	})
+
+	t.Run("existing enabled account repairs a missing local seed", func(t *testing.T) {
+		existing := &Account{
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeOAuth,
+			Extra: map[string]any{
+				codexFingerprintModeExtraKey: string(codexFingerprintDevice),
+			},
+		}
+
+		got := normalizeCRSOpenAICodexFingerprintExtra(existing, map[string]any{
+			codexFingerprintModeExtraKey: string(codexFingerprintDevice),
+			codexFingerprintSeedExtraKey: remoteSeed,
+		})
+
+		seed, ok := got[codexFingerprintSeedExtraKey].(string)
+		require.True(t, ok)
+		require.NotEqual(t, remoteSeed, seed)
+		require.True(t, isCodexFingerprintSeed(seed))
+	})
+}

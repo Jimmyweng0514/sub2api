@@ -15,6 +15,7 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -69,39 +70,97 @@ var schedulerNeutralExtraKeys = map[string]struct{}{
 	"session_window_utilization": {},
 }
 
+type compactProbeExtraUpdateGroup struct {
+	observedAt int64
+	updates    map[string]any
+}
+
+func compactProbeSnapshotExtraKey(key string) bool {
+	switch key {
+	case service.OpenAICompactProbeObservedAtUnixNanoExtraKey,
+		"openai_compact_supported",
+		"openai_compact_probe_version",
+		"openai_compact_checked_at",
+		"openai_compact_last_status",
+		"openai_compact_last_error":
+		return true
+	default:
+		return false
+	}
+}
+
+func compactProbeObservedAt(value any) (int64, bool) {
+	switch typed := value.(type) {
+	case int64:
+		return typed, typed > 0
+	case int:
+		return int64(typed), typed > 0
+	case float64:
+		return int64(typed), typed > 0 && typed == float64(int64(typed))
+	case json.Number:
+		parsed, err := typed.Int64()
+		return parsed, err == nil && parsed > 0
+	default:
+		return 0, false
+	}
+}
+
+func partitionCompactProbeExtraUpdates(updates map[string]any) (map[string]any, *compactProbeExtraUpdateGroup) {
+	common := make(map[string]any, len(updates))
+	observedAt, ok := compactProbeObservedAt(updates[service.OpenAICompactProbeObservedAtUnixNanoExtraKey])
+	if !ok {
+		for key, value := range updates {
+			common[key] = value
+		}
+		return common, nil
+	}
+	group := &compactProbeExtraUpdateGroup{observedAt: observedAt, updates: make(map[string]any)}
+	for key, value := range updates {
+		if compactProbeSnapshotExtraKey(key) {
+			group.updates[key] = value
+		} else {
+			common[key] = value
+		}
+	}
+	return common, group
+}
+
+func compactProbeExtraDeleteKeys(updates map[string]any) []string {
+	keys := make([]string, 0, 1)
+	if value, exists := updates["openai_compact_supported"]; exists && value == nil {
+		keys = append(keys, "openai_compact_supported")
+	}
+	sort.Strings(keys)
+	return keys
+}
+
 const postgresParameterBatchSize = 50000
 
+// Keep persisted seeds opaque. New/imported records receive a server-generated
+// UUIDv4, while key-level edits preserve a valid seed already stored on an
+// existing account, including canonical UUID versions from older rows.
 const codexFingerprintSeedCanonicalPattern = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 const codexFingerprintNilSeed = "00000000-0000-0000-0000-000000000000"
 
 func codexFingerprintSeedValidSQL(extraExpr string) string {
-	value := "(" + extraExpr + " ->> 'codex_fingerprint_seed')"
-	return "(" + value + " ~ '" + codexFingerprintSeedCanonicalPattern + "' AND " + value + " <> '" + codexFingerprintNilSeed + "')"
+	value := "((" + extraExpr + ") ->> 'codex_fingerprint_seed')"
+	// Match the service canonicalizer: trim surrounding whitespace, compare the
+	// UUID in lowercase, and reject only the nil UUID. New seeds remain v4, but
+	// older persisted account state may contain another canonical UUID version
+	// and must not be rotated during a key-level update.
+	canonical := "LOWER(BTRIM(" + value + "))"
+	return "(" + canonical + " ~ '" + codexFingerprintSeedCanonicalPattern + "' AND " + canonical + " <> '" + codexFingerprintNilSeed + "')"
 }
 
 func ensureCodexFingerprintSeedSQL(extraExpr string) string {
-	return "CASE WHEN platform = 'openai' AND type = 'oauth' THEN " +
-		"jsonb_set(" + extraExpr + ", '{codex_fingerprint_seed}', " +
-		"CASE WHEN " + codexFingerprintSeedValidSQL("extra") +
-		" THEN to_jsonb(extra ->> 'codex_fingerprint_seed') ELSE to_jsonb(gen_random_uuid()::text) END, true) " +
-		"ELSE " + extraExpr + " END"
-}
-
-func stripCodexFingerprintSeedFromExtraUpdate(extra map[string]any) map[string]any {
-	if extra == nil {
-		return nil
-	}
-	if _, exists := extra["codex_fingerprint_seed"]; !exists {
-		return extra
-	}
-	stripped := make(map[string]any, len(extra)-1)
-	for key, value := range extra {
-		if key == "codex_fingerprint_seed" {
-			continue
-		}
-		stripped[key] = value
-	}
-	return stripped
+	wrapped := "(" + extraExpr + ")"
+	mode := "LOWER(BTRIM(COALESCE(" + wrapped + " ->> 'codex_fingerprint_mode', '')))"
+	return "CASE WHEN platform = 'openai' AND type = 'oauth' AND " +
+		mode + " IN ('device', 'session', 'full') THEN " +
+		"jsonb_set(" + wrapped + ", '{codex_fingerprint_seed}', " +
+		"CASE WHEN " + codexFingerprintSeedValidSQL(extraExpr) +
+		" THEN to_jsonb(LOWER(BTRIM(" + wrapped + " ->> 'codex_fingerprint_seed'))) ELSE to_jsonb(gen_random_uuid()::text) END, true) " +
+		"ELSE " + wrapped + " END"
 }
 
 // NewAccountRepository 创建账户仓储实例。
@@ -136,6 +195,10 @@ func createAccountRecord(ctx context.Context, client *dbent.Client, account *ser
 	if account == nil {
 		return service.ErrAccountNilInput
 	}
+	// Repository callers include restore/sync jobs that may bypass the admin
+	// service. Normalize and complete an explicit OpenAI OAuth opt-in here as
+	// the final write guard.
+	account.Extra = service.NormalizeCodexFingerprintExtraForAccount(account.Platform, account.Type, account.Extra)
 
 	builder := client.Account.Create().
 		SetName(account.Name).
@@ -519,6 +582,9 @@ func (r *accountRepository) updateLockedAccount(
 	if err != nil {
 		return nil, err
 	}
+	// Keep direct repository updates aligned with the account lifecycle even
+	// when a caller bypasses the service-level normalizer.
+	extra = service.NormalizeCodexFingerprintExtraForExistingAccount(account, extra)
 	account.Extra = extra
 
 	schedulable := account.Schedulable
@@ -2553,19 +2619,42 @@ func (r *accountRepository) AutoPauseExpiredAccounts(ctx context.Context, now ti
 }
 
 func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates map[string]any) error {
-	updates = stripCodexFingerprintSeedFromExtraUpdate(updates)
 	if len(updates) == 0 {
 		return nil
 	}
+	codexIdentityRequested := containsCodexFingerprintExtraUpdate(updates)
+	_, codexModeRequested := updates["codex_fingerprint_mode"]
+	deleteCodexMode := false
+	if value, exists := updates["codex_fingerprint_mode"]; exists && value == nil {
+		deleteCodexMode = true
+		updates = cloneExtraWithoutKey(updates, "codex_fingerprint_mode")
+	}
+	// Normalize at the repository boundary too: background jobs and restores can
+	// bypass the admin service. The seed itself remains system-owned.
+	updates = service.RetireCodexFingerprintExtra(updates)
+	if _, requested := updates["codex_fingerprint_seed"]; requested {
+		updates = cloneExtraWithoutKey(updates, "codex_fingerprint_seed")
+	}
+	ensureCodexSeed := service.ShouldEnsureCodexFingerprintSeedForExtraUpdates(updates)
+	if len(updates) == 0 && !deleteCodexMode {
+		return nil
+	}
 
-	// 使用 JSONB 合并操作实现原子更新，避免读-改-写的并发丢失更新问题
-	payload, err := json.Marshal(updates)
+	// Compact capability observations may complete out of order. Keep the
+	// snapshot fields together and apply them only when their observation time
+	// is newer than the stored snapshot. Unrelated fields remain independent.
+	commonUpdates, compactProbeGroup := partitionCompactProbeExtraUpdates(updates)
+	payload, err := json.Marshal(commonUpdates)
 	if err != nil {
 		return err
 	}
 
 	clearProbeSnapshot := upstreamBillingProbeExplicitlyDisabled(updates) || upstreamBillingProbeSnapshotClearRequested(updates)
-	durableSchedulerChange := shouldEnqueueSchedulerOutboxForExtraUpdates(updates) || clearProbeSnapshot
+	// Deleting the fingerprint mode is a durable routing change too. The mode
+	// is removed from `updates` above so it can be expressed as a JSONB key
+	// deletion; keep it in this predicate or other instances will retain a
+	// stale scheduler snapshot until their next full rebuild.
+	durableSchedulerChange := shouldEnqueueSchedulerOutboxForExtraUpdates(updates) || clearProbeSnapshot || deleteCodexMode
 	baseCtx := ctx
 	contextTx := dbent.TxFromContext(ctx)
 	client := clientFromContext(ctx, r.client)
@@ -2586,13 +2675,48 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 	if clearProbeSnapshot {
 		extraExpression = "(" + extraExpression + ") - 'upstream_billing_probe'"
 	}
-	if service.ShouldEnsureCodexFingerprintSeedForExtraUpdates(updates) {
+	args := []any{string(payload), id}
+	if deleteKeys := compactProbeExtraDeleteKeys(commonUpdates); len(deleteKeys) > 0 {
+		extraExpression = "(" + extraExpression + ") - $3::text[]"
+		args = append(args, pq.Array(deleteKeys))
+	}
+	if compactProbeGroup != nil {
+		previousExpression := extraExpression
+		observedAtParam := "$" + strconv.Itoa(len(args)+1)
+		args = append(args, compactProbeGroup.observedAt)
+		groupPayload, marshalErr := json.Marshal(compactProbeGroup.updates)
+		if marshalErr != nil {
+			return marshalErr
+		}
+		payloadParam := "$" + strconv.Itoa(len(args)+1)
+		args = append(args, string(groupPayload))
+		candidateExpression := "(" + previousExpression + " || " + payloadParam + "::jsonb)"
+		if deleteKeys := compactProbeExtraDeleteKeys(compactProbeGroup.updates); len(deleteKeys) > 0 {
+			deleteParam := "$" + strconv.Itoa(len(args)+1)
+			args = append(args, pq.Array(deleteKeys))
+			candidateExpression = "(" + candidateExpression + ") - " + deleteParam + "::text[]"
+		}
+		storedObservedAt := "COALESCE(CASE WHEN jsonb_typeof(COALESCE(extra, '{}'::jsonb)->'" + service.OpenAICompactProbeObservedAtUnixNanoExtraKey + "') = 'number' THEN (extra->>'" + service.OpenAICompactProbeObservedAtUnixNanoExtraKey + "')::numeric END, 0)"
+		extraExpression = "CASE WHEN " + storedObservedAt + " <= " + observedAtParam + "::numeric THEN " + candidateExpression + " ELSE " + previousExpression + " END"
+	}
+	if deleteCodexMode {
+		extraExpression = "(" + extraExpression + ") - 'codex_fingerprint_mode'"
+	}
+	if codexModeRequested {
+		// An explicit mode edit acknowledges the ambiguous historical migration
+		// marker.  Keep the marker for unrelated background extra updates.
+		extraExpression = "(" + extraExpression + ") - '" + service.CodexFingerprintRecoveryRequiredExtraKey + "'"
+	}
+	if ensureCodexSeed {
 		extraExpression = ensureCodexFingerprintSeedSQL(extraExpression)
+	}
+	if codexIdentityRequested {
+		extraExpression = codexFingerprintExtraForOAuthOnlySQL(extraExpression)
 	}
 	result, err := client.ExecContext(
 		ctx,
 		"UPDATE accounts SET extra = "+extraExpression+", updated_at = NOW() WHERE id = $2 AND deleted_at IS NULL",
-		string(payload), id,
+		args...,
 	)
 
 	if err != nil {
@@ -2627,6 +2751,39 @@ func (r *accountRepository) UpdateExtra(ctx context.Context, id int64, updates m
 		}
 	}
 	return nil
+}
+
+func cloneExtraWithoutKey(extra map[string]any, key string) map[string]any {
+	if len(extra) == 0 {
+		return nil
+	}
+	cloned := make(map[string]any, len(extra)-1)
+	for name, value := range extra {
+		if name != key {
+			cloned[name] = value
+		}
+	}
+	return cloned
+}
+
+func containsCodexFingerprintExtraUpdate(extra map[string]any) bool {
+	for _, key := range []string{
+		"codex_fingerprint_mode",
+		"codex_fingerprint_seed",
+		service.CodexFingerprintRecoveryRequiredExtraKey,
+		"openai_device_id",
+		"openai_session_id",
+	} {
+		if _, ok := extra[key]; ok {
+			return true
+		}
+	}
+	return false
+}
+
+func codexFingerprintExtraForOAuthOnlySQL(extraExpr string) string {
+	return "CASE WHEN platform = 'openai' AND type = 'oauth' THEN " + extraExpr +
+		" ELSE (" + extraExpr + ") - 'codex_fingerprint_mode' - 'codex_fingerprint_seed' - '" + service.CodexFingerprintRecoveryRequiredExtraKey + "' - 'openai_device_id' - 'openai_session_id' END"
 }
 
 // UpdateUpstreamBillingProbeSnapshot stores a probe result only while the
@@ -2830,7 +2987,18 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 	if len(ids) == 0 {
 		return 0, nil
 	}
-	updates.Extra = stripCodexFingerprintSeedFromExtraUpdate(updates.Extra)
+	codexIdentityRequested := containsCodexFingerprintExtraUpdate(updates.Extra)
+	_, codexModeRequested := updates.Extra["codex_fingerprint_mode"]
+	deleteCodexMode := false
+	if value, exists := updates.Extra["codex_fingerprint_mode"]; exists && value == nil {
+		deleteCodexMode = true
+		updates.Extra = cloneExtraWithoutKey(updates.Extra, "codex_fingerprint_mode")
+	}
+	updates.Extra = service.RetireCodexFingerprintExtra(updates.Extra)
+	if _, requested := updates.Extra["codex_fingerprint_seed"]; requested {
+		updates.Extra = cloneExtraWithoutKey(updates.Extra, "codex_fingerprint_seed")
+	}
+	updates.EnsureCodexFingerprintSeed = updates.EnsureCodexFingerprintSeed || service.ShouldEnsureCodexFingerprintSeedForExtraUpdates(updates.Extra)
 
 	setClauses := make([]string, 0, 8)
 	args := make([]any, 0, 8)
@@ -2918,7 +3086,7 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 				" AND "+ollamaCloudBaseURLMatchesSQL(credentialPlaceholder+"::jsonb ->> 'base_url'")+")")
 	}
 
-	if len(updates.Extra) > 0 || len(ollamaGroupIdentityChanges) > 0 || ollamaProxyIdentityChanged != "" || updates.EnsureCodexFingerprintSeed {
+	if len(updates.Extra) > 0 || len(ollamaGroupIdentityChanges) > 0 || ollamaProxyIdentityChanged != "" || updates.EnsureCodexFingerprintSeed || deleteCodexMode {
 		extraExpression := "COALESCE(extra, '{}'::jsonb)"
 		if len(updates.Extra) > 0 {
 			payload, err := json.Marshal(updates.Extra)
@@ -2957,8 +3125,19 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		} else if snapshotIdentityChanged != "" {
 			extraExpression = "CASE WHEN " + snapshotIdentityChanged + " THEN (" + extraExpression + ") - 'ollama_cloud_usage_snapshot' ELSE " + extraExpression + " END"
 		}
+		if deleteCodexMode {
+			extraExpression = "(" + extraExpression + ") - 'codex_fingerprint_mode'"
+		}
+		if codexModeRequested {
+			// An explicit mode edit acknowledges the ambiguous historical
+			// migration marker; unrelated bulk updates leave it intact.
+			extraExpression = "(" + extraExpression + ") - '" + service.CodexFingerprintRecoveryRequiredExtraKey + "'"
+		}
 		if updates.EnsureCodexFingerprintSeed {
 			extraExpression = ensureCodexFingerprintSeedSQL(extraExpression)
+		}
+		if codexIdentityRequested {
+			extraExpression = codexFingerprintExtraForOAuthOnlySQL(extraExpression)
 		}
 		setClauses = append(setClauses, "extra = "+extraExpression)
 	}
@@ -3031,7 +3210,12 @@ func (r *accountRepository) BulkUpdate(ctx context.Context, ids []int64, updates
 		}
 	}
 	if rows > 0 && contextTx == nil {
-		shouldSync := false
+		// A bulk fingerprint-mode edit changes the account identity projection
+		// even when the mode already has a persisted seed (including switching
+		// back to off). Refresh scheduler snapshots immediately so the next
+		// request cannot reuse the pre-edit mode until the outbox worker runs.
+		identityChanged := codexIdentityRequested || updates.ProxyID != nil || len(updates.Credentials) > 0
+		shouldSync := updates.EnsureCodexFingerprintSeed || deleteCodexMode || identityChanged
 		if updates.Status != nil && (*updates.Status == service.StatusError || *updates.Status == service.StatusDisabled) {
 			shouldSync = true
 		}
@@ -3369,13 +3553,15 @@ func accountEntityToService(m *dbent.Account) *service.Account {
 	rateMultiplier := m.RateMultiplier
 
 	return &service.Account{
-		ID:                      m.ID,
-		Name:                    m.Name,
-		Notes:                   m.Notes,
-		Platform:                m.Platform,
-		Type:                    m.Type,
-		Credentials:             copyJSONMap(m.Credentials),
-		Extra:                   copyJSONMap(m.Extra),
+		ID:          m.ID,
+		Name:        m.Name,
+		Notes:       m.Notes,
+		Platform:    m.Platform,
+		Type:        m.Type,
+		Credentials: copyJSONMap(m.Credentials),
+		// Reads also apply the retirement boundary so pre-migration rows cannot
+		// leak an account-owned Codex identity back into a caller or scheduler.
+		Extra:                   service.RetireCodexFingerprintExtra(copyJSONMap(m.Extra)),
 		ProxyID:                 m.ProxyID,
 		ProxyFallbackOriginID:   m.ProxyFallbackOriginID,
 		Concurrency:             m.Concurrency,

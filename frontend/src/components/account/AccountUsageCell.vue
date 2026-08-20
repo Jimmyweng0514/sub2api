@@ -87,6 +87,7 @@
           </span>
           <button
             type="button"
+            data-testid="openai-active-usage-query"
             class="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[9px] font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/30 transition-colors"
             :disabled="activeQueryLoading"
             @click="loadActiveUsage"
@@ -146,6 +147,7 @@
           <template #pre-actions>
             <button
               type="button"
+              data-testid="openai-active-usage-query"
               class="inline-flex items-center gap-0.5 rounded px-1.5 py-0.5 text-[10px] font-medium text-blue-600 hover:bg-blue-50 dark:text-blue-400 dark:hover:bg-blue-900/30 transition-colors disabled:cursor-not-allowed disabled:opacity-50"
               :disabled="activeQueryLoading"
               @click="loadActiveUsage"
@@ -335,7 +337,7 @@
       <div v-else class="text-xs text-gray-400">-</div>
     </template>
 
-    <!-- Grok OAuth accounts: passive xAI quota headers + local Sub2API usage -->
+    <!-- Grok OAuth accounts: passive xAI quota headers + local Sub2API Plus usage -->
     <template v-else-if="account.platform === 'grok' && account.type === 'oauth'">
       <div v-if="loading" class="space-y-1.5">
         <div class="flex items-center gap-1">
@@ -1446,6 +1448,32 @@ const loadActiveUsage = async () => {
   activeQueryLoading.value = true
   try {
     usageInfo.value = await adminAPI.accounts.getUsage(props.account.id, 'active', true)
+
+    // OpenAI's active usage probe also persists the /wham/usage credit
+    // snapshot on the server, but the usage endpoint intentionally returns
+    // only window data. Re-read the account so the adjacent Codex credit card
+    // reflects that same query instead of waiting for a list refresh or a
+    // separate inventory action. Other providers keep their existing single
+    // request behavior.
+    if (props.account.platform === 'openai' && props.account.type === 'oauth') {
+      const getAccount = adminAPI.accounts.getById
+      if (typeof getAccount === 'function') {
+        try {
+          const refreshedAccount = await getAccount(props.account.id)
+          // The active request already supplied the authoritative usage data;
+          // suppress the row-key watcher from immediately issuing a duplicate
+          // background /usage request when the account patch lands.
+          if (!unmounted.value && refreshedAccount) {
+            suppressOpenAIUsageRefreshUntil.value = Date.now() + SUPPRESS_USAGE_REFRESH_WINDOW_MS
+            emit('account-updated', refreshedAccount)
+          }
+        } catch (e) {
+          // A successful usage response remains useful even if the follow-up
+          // row refresh fails; the next list refresh can reconcile the card.
+          console.warn('Failed to refresh OpenAI account snapshot after usage query:', e)
+        }
+      }
+    }
   } catch (e: any) {
     console.error('Failed to load active usage:', e)
   } finally {

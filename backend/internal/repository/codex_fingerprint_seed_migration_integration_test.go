@@ -21,69 +21,102 @@ func requireCanonicalUUIDString(t *testing.T, value string) {
 	require.Equal(t, parsed.String(), value)
 }
 
-func TestMigration225BackfillsOnlyEnabledOpenAIOAuthMissingOrMalformedSeeds(t *testing.T) {
+func TestCodexFingerprintSeedMigrationsPreservePublished225AndRepairActiveRows(t *testing.T) {
 	tx := testTx(t)
 	ctx := context.Background()
-	migrationSQL, err := dbmigrations.FS.ReadFile("225_backfill_codex_fingerprint_seed.sql")
-	require.NoError(t, err)
-
-	var missingID, blankID, malformedID, validID, offID, apiKeyID int64
-	require.NoError(t, tx.QueryRowContext(ctx, `
-INSERT INTO accounts (name, platform, type, extra)
-VALUES ('migration-225-missing', 'openai', 'oauth', '{"codex_fingerprint_mode":"session"}'::jsonb)
-RETURNING id
-`).Scan(&missingID))
-	require.NoError(t, tx.QueryRowContext(ctx, `
-INSERT INTO accounts (name, platform, type, extra)
-VALUES ('migration-225-blank', 'openai', 'oauth', '{"codex_fingerprint_mode":"device","codex_fingerprint_seed":""}'::jsonb)
-RETURNING id
-`).Scan(&blankID))
-	require.NoError(t, tx.QueryRowContext(ctx, `
-INSERT INTO accounts (name, platform, type, extra)
-VALUES ('migration-225-malformed', 'openai', 'oauth', '{"codex_fingerprint_mode":"full","codex_fingerprint_seed":"BAD"}'::jsonb)
-RETURNING id
-`).Scan(&malformedID))
-	require.NoError(t, tx.QueryRowContext(ctx, `
-INSERT INTO accounts (name, platform, type, extra)
-VALUES ('migration-225-valid', 'openai', 'oauth', '{"codex_fingerprint_mode":"session","codex_fingerprint_seed":"11111111-1111-4111-8111-111111111111"}'::jsonb)
-RETURNING id
-`).Scan(&validID))
-	require.NoError(t, tx.QueryRowContext(ctx, `
-INSERT INTO accounts (name, platform, type, extra)
-VALUES ('migration-225-off', 'openai', 'oauth', '{"codex_fingerprint_mode":"off"}'::jsonb)
-RETURNING id
-`).Scan(&offID))
-	require.NoError(t, tx.QueryRowContext(ctx, `
-INSERT INTO accounts (name, platform, type, extra)
-VALUES ('migration-225-apikey', 'openai', 'apikey', '{"codex_fingerprint_mode":"session"}'::jsonb)
-RETURNING id
-`).Scan(&apiKeyID))
-
-	_, err = tx.ExecContext(ctx, string(migrationSQL))
-	require.NoError(t, err)
-
-	seedsAfterFirst := map[int64]string{}
-	for _, id := range []int64{missingID, blankID, malformedID, validID} {
-		var seed string
-		require.NoError(t, tx.QueryRowContext(ctx, `SELECT extra->>'codex_fingerprint_seed' FROM accounts WHERE id = $1`, id).Scan(&seed))
-		requireCanonicalUUIDString(t, seed)
-		seedsAfterFirst[id] = seed
+	migrationSQL := make(map[string]string, 4)
+	for _, name := range []string{
+		"225_backfill_codex_fingerprint_seed.sql",
+		"228_repair_codex_fingerprint_seed.sql",
+		"229_repair_codex_fingerprint_mode_format.sql",
+		"231_repair_active_codex_fingerprint_seed.sql",
+	} {
+		content, err := dbmigrations.FS.ReadFile(name)
+		require.NoError(t, err)
+		migrationSQL[name] = string(content)
 	}
-	require.Equal(t, "11111111-1111-4111-8111-111111111111", seedsAfterFirst[validID])
 
-	for _, id := range []int64{offID, apiKeyID} {
+	insertAccount := func(name, accountType, extra string, deleted bool) int64 {
+		t.Helper()
+		query := `
+INSERT INTO accounts (name, platform, type, extra)
+VALUES ($1, 'openai', $2, $3::jsonb)
+RETURNING id
+`
+		if deleted {
+			query = `
+INSERT INTO accounts (name, platform, type, extra, deleted_at)
+VALUES ($1, 'openai', $2, $3::jsonb, NOW())
+RETURNING id
+`
+		}
+		var id int64
+		require.NoError(t, tx.QueryRowContext(ctx, query, name, accountType, extra).Scan(&id))
+		return id
+	}
+	readSeed := func(id int64) string {
+		t.Helper()
+		var seed string
+		require.NoError(t, tx.QueryRowContext(ctx, `SELECT COALESCE(extra->>'codex_fingerprint_seed', '') FROM accounts WHERE id = $1`, id).Scan(&seed))
+		return seed
+	}
+	requireNoSeed := func(id int64) {
+		t.Helper()
 		var hasSeed bool
 		require.NoError(t, tx.QueryRowContext(ctx, `SELECT extra ? 'codex_fingerprint_seed' FROM accounts WHERE id = $1`, id).Scan(&hasSeed))
 		require.False(t, hasSeed)
 	}
 
-	_, err = tx.ExecContext(ctx, string(migrationSQL))
+	missingID := insertAccount("migration-225-missing", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"session"}`, false)
+	blankID := insertAccount("migration-225-blank", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"device","codex_fingerprint_seed":""}`, false)
+	malformedID := insertAccount("migration-225-malformed", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"full","codex_fingerprint_seed":"BAD"}`, false)
+	validID := insertAccount("migration-225-valid", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"session","codex_fingerprint_seed":"11111111-1111-4111-8111-111111111111"}`, false)
+	upperCaseID := insertAccount("migration-225-uppercase", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"full","codex_fingerprint_seed":"11111111-1111-4111-8111-11111111111A"}`, false)
+	offID := insertAccount("migration-225-off", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"off"}`, false)
+	apiKeyID := insertAccount("migration-225-apikey", service.AccountTypeAPIKey, `{"codex_fingerprint_mode":"session"}`, false)
+
+	// 225 is immutable in deployed databases. Its original semantics only fill
+	// blank values; malformed seeds are repaired by later forward migrations.
+	_, err := tx.ExecContext(ctx, migrationSQL["225_backfill_codex_fingerprint_seed.sql"])
+	require.NoError(t, err)
+	for _, id := range []int64{missingID, blankID} {
+		requireCanonicalUUIDString(t, readSeed(id))
+	}
+	require.Equal(t, "BAD", readSeed(malformedID))
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", readSeed(validID))
+	require.Equal(t, "11111111-1111-4111-8111-11111111111A", readSeed(upperCaseID))
+	requireNoSeed(offID)
+	requireNoSeed(apiKeyID)
+
+	for _, name := range []string{
+		"228_repair_codex_fingerprint_seed.sql",
+		"229_repair_codex_fingerprint_mode_format.sql",
+	} {
+		_, err := tx.ExecContext(ctx, migrationSQL[name])
+		require.NoError(t, err)
+	}
+	lateMalformedID := insertAccount("migration-231-late-malformed", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"session","codex_fingerprint_seed":"BAD"}`, false)
+	_, err = tx.ExecContext(ctx, migrationSQL["231_repair_active_codex_fingerprint_seed.sql"])
 	require.NoError(t, err)
 
-	for id, want := range seedsAfterFirst {
-		var got string
-		require.NoError(t, tx.QueryRowContext(ctx, `SELECT extra->>'codex_fingerprint_seed' FROM accounts WHERE id = $1`, id).Scan(&got))
-		require.Equal(t, want, got)
+	seedsAfterRepair := map[int64]string{}
+	for _, id := range []int64{missingID, blankID, malformedID, validID, upperCaseID, lateMalformedID} {
+		seed := readSeed(id)
+		requireCanonicalUUIDString(t, seed)
+		seedsAfterRepair[id] = seed
+	}
+	require.Equal(t, "11111111-1111-4111-8111-111111111111", seedsAfterRepair[validID])
+	require.Equal(t, "11111111-1111-4111-8111-11111111111a", seedsAfterRepair[upperCaseID])
+	requireNoSeed(offID)
+	requireNoSeed(apiKeyID)
+
+	// The forward repair is idempotent and deliberately skips soft-deleted rows.
+	deletedID := insertAccount("migration-231-deleted", service.AccountTypeOAuth, `{"codex_fingerprint_mode":"session","codex_fingerprint_seed":"BAD"}`, true)
+	_, err = tx.ExecContext(ctx, migrationSQL["231_repair_active_codex_fingerprint_seed.sql"])
+	require.NoError(t, err)
+	require.Equal(t, "BAD", readSeed(deletedID))
+	for id, want := range seedsAfterRepair {
+		require.Equal(t, want, readSeed(id))
 	}
 }
 

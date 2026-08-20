@@ -954,14 +954,9 @@ type GatewayConfig struct {
 	// ForceCodexCLI: 强制将 OpenAI `/v1/responses` 请求按 Codex CLI 处理。
 	// 用于网关未透传/改写 User-Agent 时的兼容兜底（默认关闭，避免影响其他客户端）。
 	ForceCodexCLI bool `mapstructure:"force_codex_cli"`
-	// DisableCodexIdentityEnforcement: 关闭「强制统一 Codex 出站身份」。上游 /backend-api/codex
-	// 在容量紧张时按客户端身份分优先级降载，被降载的请求会拿到 HTTP 200 + 流内
-	// server_is_overloaded，该次请求失败。默认强制统一出口：所有 OAuth 出站的
-	// User-Agent / originator / version 都改写为网关规范身份，确保没有请求带着第三方或陈旧身份
-	// 出站。置 true 后退回「仅按最终 User-Agent 配对 originator」的收口语义，供上游策略变动时回滚。
-	//
-	// 取反义命名是为了让零值安全：该开关会发布为进程级快照，未经 viper 加载而手工构造的
-	// Config（测试、工具）其零值必须落在「强制统一开启」这一侧，否则会静默丢掉这层保护。
+	// DisableCodexIdentityEnforcement: 关闭「强制统一 Codex 出站身份」。默认情况下
+	// OAuth 出站请求会使用网关规范身份；置 true 后仅按最终 User-Agent 配对身份头，
+	// 用于在上游策略调整时回退。
 	DisableCodexIdentityEnforcement bool `mapstructure:"disable_codex_identity_enforcement"`
 	// DisableCodexOriginatorNormalization: 已废弃，等价于 DisableCodexIdentityEnforcement。
 	// 保留以兼容既有配置文件；加载时会折叠进新键，不要在新代码里直接读取。
@@ -1805,12 +1800,6 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 	if cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate == 0 {
 		cfg.Gateway.OpenAIScheduler.StickyEscapeErrorRate = 0.5
 	}
-	// Kept as a backstop: setEnvReachableDefaults now registers this key with its
-	// effective default (true), so IsSet always reports true and this branch no
-	// longer fires. It still guards the default if that registration is dropped.
-	if !cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled && !viper.IsSet("gateway.openai_scheduler.sticky_escape_enabled") {
-		cfg.Gateway.OpenAIScheduler.StickyEscapeEnabled = true
-	}
 
 	cfg.RunMode = NormalizeRunMode(cfg.RunMode)
 	cfg.Server.Mode = strings.ToLower(strings.TrimSpace(cfg.Server.Mode))
@@ -1878,9 +1867,10 @@ func load(allowMissingJWTSecret bool) (*Config, error) {
 		cfg.Gateway.ForcedCodexInstructionsTemplate = string(content)
 	}
 
-	// 兼容旧键 gateway.disable_codex_originator_normalization：语义已被
-	// disable_codex_identity_enforcement 取代（身份改写升级为强制统一出口），
-	// 任一为 true 即关闭强制统一。
+	// Preserve the legacy setting's established meaning. Older deployments
+	// used disable_codex_originator_normalization to opt out of the unified
+	// Codex identity projection; fold it into the newer enforcement switch
+	// before the gateway publishes its process-wide identity policy.
 	if cfg.Gateway.DisableCodexOriginatorNormalization {
 		cfg.Gateway.DisableCodexIdentityEnforcement = true
 	}
@@ -2010,7 +2000,7 @@ func setDefaults() {
 	// WebAuthn / Passkeys are opt-in because every deployment must explicitly
 	// declare its relying-party domain and trusted browser origins.
 	viper.SetDefault("webauthn.enabled", false)
-	viper.SetDefault("webauthn.rp_display_name", "Sub2API")
+	viper.SetDefault("webauthn.rp_display_name", "Sub2API Plus")
 	viper.SetDefault("webauthn.rp_id", "")
 	viper.SetDefault("webauthn.rp_origins", []string{})
 
@@ -2551,12 +2541,9 @@ func setEnvReachableDefaults() {
 	viper.SetDefault("gateway.user_message_queue.mode", "")
 	viper.SetDefault("update.proxy_url", "")
 
-	// sticky_escape_enabled is the one exception to the zero-value rule: its
-	// effective default is true, applied post-unmarshal via a viper.IsSet guard.
-	// Registering false would make IsSet always report true and permanently
-	// disable sticky escape, so register the effective default instead. An
-	// explicit false in config or env still wins.
-	viper.SetDefault("gateway.openai_scheduler.sticky_escape_enabled", true)
+	// sticky_escape 默认关闭：TTFT 抖动与账号打满是高并发常态，自动逃逸会把
+	// 同一会话拆到多个账号并摧毁上游 prompt cache；需要的管理员显式开启。
+	viper.SetDefault("gateway.openai_scheduler.sticky_escape_enabled", false)
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_error_rate", 0.0)
 	viper.SetDefault("gateway.openai_scheduler.sticky_escape_ttft_ms", 0)
 

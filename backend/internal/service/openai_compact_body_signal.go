@@ -40,38 +40,45 @@ func ensureOpenAIRemoteCompactionV2BetaFeature(h http.Header) {
 		return
 	}
 	tokens := make([]string, 0, 4)
-	for _, value := range h.Values("x-codex-beta-features") {
+	seen := make(map[string]struct{}, 4)
+	for _, value := range openAICodexBetaFeatureHeaderValues(h) {
 		for _, token := range strings.Split(value, ",") {
 			token = strings.TrimSpace(token)
 			if token == "" {
 				continue
 			}
-			if token == openAIRemoteCompactionV2Feature {
-				return
+			if _, exists := seen[token]; exists {
+				continue
 			}
+			seen[token] = struct{}{}
 			tokens = append(tokens, token)
 		}
 	}
-	tokens = append(tokens, openAIRemoteCompactionV2Feature)
+	if _, exists := seen[openAIRemoteCompactionV2Feature]; !exists {
+		tokens = append(tokens, openAIRemoteCompactionV2Feature)
+	}
+	deleteOpenAIHeaderEqualFold(h, "x-codex-beta-features")
 	h.Set("x-codex-beta-features", strings.Join(tokens, ","))
+}
+
+func openAICodexBetaFeatureHeaderValues(h http.Header) []string {
+	if h == nil {
+		return nil
+	}
+	values := make([]string, 0, 2)
+	for name, headerValues := range h {
+		if strings.EqualFold(strings.TrimSpace(name), "x-codex-beta-features") {
+			values = append(values, headerValues...)
+		}
+	}
+	return values
 }
 
 // hasOpenAICodexBetaFeaturesHeader 报告出站头里是否已存在非空的
 // x-codex-beta-features（即客户端自己声明过能力集）。
-func hasOpenAICodexBetaFeaturesHeader(h http.Header) bool {
-	if h == nil {
-		return false
-	}
-	for _, value := range h.Values("x-codex-beta-features") {
-		if strings.TrimSpace(value) != "" {
-			return true
-		}
-	}
-	return false
-}
-
-// applyOpenAICodexBetaFeatures 按真实 Codex 的会话级行为补注
-// x-codex-beta-features。
+// applyOpenAICodexBetaFeatures preserves the feature set declared by Codex.
+// Native remote compaction v2 is the only wire shape that requires the
+// gateway to add its explicit capability token.
 //
 // codex 侧规则（codex-rs：session/mod.rs build_model_client_beta_features_header
 // 组装、client.rs build_responses_headers 附加）：该头是**会话级常量**，挂在
@@ -99,21 +106,13 @@ func applyOpenAICodexBetaFeatures(c *gin.Context, account *Account, h http.Heade
 	}
 	if isOpenAINativeCompactionV2(c) {
 		ensureOpenAIRemoteCompactionV2BetaFeature(h)
-		return
 	}
-	if account == nil || !account.IsOpenAIOAuth() {
-		return
-	}
-	if hasOpenAICodexBetaFeaturesHeader(h) {
-		return
-	}
-	h.Set("x-codex-beta-features", openAIRemoteCompactionV2Feature)
 }
 
 // HasCompactionTriggerInInput detects an input item with
 // type="compaction_trigger". The handler combines this body signal with the
-// request path and stream flag to distinguish the native remote compaction v2
-// wire from the legacy /responses/compact bridge.
+// request path, stream flag, and Codex beta feature header to distinguish the
+// native remote compaction v2 wire from the legacy /responses/compact bridge.
 func HasCompactionTriggerInInput(body []byte) bool {
 	if len(body) == 0 {
 		return false

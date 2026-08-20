@@ -88,7 +88,7 @@ const (
 	defaultGrokImageTestPrompt   = "Generate a cute orange cat astronaut sticker on a clean pastel background."
 	defaultGrokVideoTestPrompt   = "A red ball bouncing once on a white floor, short simple motion."
 	defaultGrokSearchTestQuery   = "xAI Grok"
-	defaultGrokTTSTestText       = "Hello from Sub2API account connectivity test."
+	defaultGrokTTSTestText       = "Hello from Sub2API Plus account connectivity test."
 
 	// Grok account-test modes (admin UI). Empty / default / text = Responses probe.
 	// image/video may also be inferred from model_id when mode is default.
@@ -145,6 +145,8 @@ type AccountTestService struct {
 	httpUpstream              HTTPUpstream
 	cfg                       *config.Config
 	settingService            *SettingService
+	openAIQuotaService        openAIHealthQuotaService
+	rateLimitService          *RateLimitService
 	tlsFPProfileService       *TLSFingerprintProfileService
 	agentIdentityTaskMu       sync.Mutex
 	agentIdentityWS           agentIdentityWSConnectionInvalidator
@@ -156,6 +158,18 @@ type AccountTestService struct {
 func (s *AccountTestService) SetSettingService(settingService *SettingService) {
 	if s != nil {
 		s.settingService = settingService
+	}
+}
+
+func (s *AccountTestService) SetOpenAIQuotaService(quotaService openAIHealthQuotaService) {
+	if s != nil {
+		s.openAIQuotaService = quotaService
+	}
+}
+
+func (s *AccountTestService) SetRateLimitService(rateLimitService *RateLimitService) {
+	if s != nil {
+		s.rateLimitService = rateLimitService
 	}
 }
 
@@ -761,16 +775,8 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 		req.Host = "chatgpt.com"
 		req.Header.Set("accept", "text/event-stream")
 		req.Header.Set("OpenAI-Beta", "responses=experimental")
-		canonical := resolveCodexOutboundIdentity("")
-		req.Header.Set("Originator", canonical.originator)
-		if customUA := strings.TrimSpace(credentialAccount.GetOpenAIUserAgent()); customUA != "" {
-			req.Header.Set("User-Agent", customUA)
-		} else {
-			req.Header.Set("User-Agent", canonical.userAgent)
-		}
+		applyOpenAICodexProbeHeaders(req.Header)
 		setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
-		// 与真实转发一致：账号级自定义 UA 同样作为管理员显式配置传入，否则测试用的身份
-		// 与该账号真实出站的身份不是同一个（issue #3901 的配对不变式由收口保证）。
 		enforceCodexIdentityHeadersWithUA(req.Header, credentialAccount.GetOpenAIUserAgent())
 	}
 
@@ -778,9 +784,9 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 	credentialAccount.ApplyHeaderOverrides(req.Header)
 
 	// Get proxy URL
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := accountTestProxyURL(account)
+	if proxyErr != nil {
+		return s.sendErrorAndEnd(c, proxyErr.Error())
 	}
 
 	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
@@ -807,11 +813,11 @@ func (s *AccountTestService) testOpenAIAccountConnection(c *gin.Context, account
 			c.Request = c.Request.WithContext(markAgentIdentityTaskRecoveryTried(ctx))
 			return s.testOpenAIAccountConnection(c, account, modelID, prompt, mode)
 		}
-		if resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode == http.StatusTooManyRequests && !isAccountHealthProbeContext(ctx) {
 			s.reconcileOpenAI429State(ctx, account, resp.Header, body)
 		}
 		// 401 Unauthorized: 标记账号为永久错误
-		if resp.StatusCode == http.StatusUnauthorized && s.accountRepo != nil {
+		if resp.StatusCode == http.StatusUnauthorized && s.accountRepo != nil && !isAccountHealthProbeContext(ctx) {
 			errMsg := fmt.Sprintf("Authentication failed (401): %s", string(body))
 			_ = s.accountRepo.SetError(ctx, account.ID, errMsg)
 		}
@@ -960,6 +966,14 @@ func (s *AccountTestService) grokTestProxyURL(account *Account) string {
 		return account.Proxy.URL()
 	}
 	return ""
+}
+
+// accountTestProxyURL never silently falls back to a direct connection when
+// the account explicitly selected a proxy. AccountRepository hydrates Proxy on
+// GetByID; a missing/mismatched proxy therefore indicates a configuration or
+// data-integrity fault that an admin must resolve before probing upstream.
+func accountTestProxyURL(account *Account) (string, error) {
+	return resolveRequiredOpenAIProxyURL(account)
 }
 
 func (s *AccountTestService) prepareGrokTestSSE(c *gin.Context) {
@@ -1982,9 +1996,9 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
 	account.ApplyHeaderOverrides(req.Header)
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := accountTestProxyURL(account)
+	if proxyErr != nil {
+		return s.sendErrorAndEnd(c, proxyErr.Error())
 	}
 
 	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
@@ -1995,10 +2009,10 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 
 	if resp.StatusCode != http.StatusOK {
 		body, _ := io.ReadAll(resp.Body)
-		if resp.StatusCode == http.StatusTooManyRequests {
+		if resp.StatusCode == http.StatusTooManyRequests && !isAccountHealthProbeContext(ctx) {
 			s.reconcileOpenAI429State(ctx, account, resp.Header, body)
 		}
-		if resp.StatusCode == http.StatusUnauthorized && s.accountRepo != nil {
+		if resp.StatusCode == http.StatusUnauthorized && s.accountRepo != nil && !isAccountHealthProbeContext(ctx) {
 			errMsg := fmt.Sprintf("Chat Completions authentication failed (401): %s", string(body))
 			_ = s.accountRepo.SetError(ctx, account.ID, errMsg)
 		}
@@ -2014,6 +2028,7 @@ func (s *AccountTestService) testOpenAIChatCompletionsConnection(
 // endpoint has been sunset upstream (404, #5598/#5624) and is no longer probed.
 func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account *Account, testModelID string) error {
 	ctx := c.Request.Context()
+	probeStartedAt := time.Now().UTC()
 	credentialAccount := account
 	if account.IsShadow() {
 		resolved, err := resolveCredentialAccount(ctx, s.accountRepo, account)
@@ -2065,7 +2080,27 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 	if isOAuth {
 		testModelID = normalizeOpenAIModelForUpstream(credentialAccount, testModelID)
 	}
-	payloadBytes, _ := json.Marshal(createOpenAICompactProbePayload(testModelID, isOAuth))
+	probeSessionID := compactProbeSessionID(credentialAccount.ID)
+	probePayload := createOpenAICompactProbePayload(testModelID, isOAuth)
+	// Codex defaults the compact cache domain to its session identity. Keep the
+	// probe on that same root instead of deriving a second account-local key.
+	probePayload["prompt_cache_key"] = probeSessionID
+	var fingerprintIDs *codexFingerprintIDs
+	if isOAuth {
+		probeBodyForIDs, _ := json.Marshal(probePayload)
+		fingerprintIDs = resolveCodexFingerprintIDsForRequest(
+			credentialAccount,
+			nil,
+			probeBodyForIDs,
+			0,
+			codexFingerprintDeploymentSeed(s.cfg),
+		)
+		if fingerprintIDs != nil {
+			probePayload["client_metadata"] = map[string]any{"session_id": probeSessionID}
+			_ = applyCodexFingerprintClientMetadata(probePayload, fingerprintIDs)
+		}
+	}
+	payloadBytes, _ := json.Marshal(probePayload)
 	if !agentIdentityTaskRecoveryWasTried(ctx) {
 		s.sendEvent(c, TestEvent{Type: "test_start", Model: testModelID})
 	}
@@ -2094,46 +2129,54 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 		req.Header.Set("Authorization", "Bearer "+authToken)
 	}
 	applyOpenAICodexProbeHeaders(req.Header)
-	if isOAuth {
-		enforceCodexIdentityHeadersWithUA(req.Header, credentialAccount.GetOpenAIUserAgent())
-	}
-	probeSessionID := compactProbeSessionID(account.ID)
-	req.Header.Set("Session_ID", probeSessionID)
+	req.Header.Set("session-id", probeSessionID)
+	// Keep the legacy ChatGPT aliases alongside the Codex CLI hyphenated form;
+	// several compatible upstream relays still inspect the underscore names.
+	req.Header.Set("session_id", probeSessionID)
+	req.Header.Set("Session_Id", probeSessionID)
+	req.Header.Set("thread-id", probeSessionID)
+	req.Header.Set("thread_id", probeSessionID)
 	req.Header.Set("Conversation_ID", probeSessionID)
 
 	if isOAuth {
 		req.Host = "chatgpt.com"
 		setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
-		// 指纹收敛：探测与真实转发走同一个 /responses 端点，身份也必须同构，
-		// 否则探测流量会以「缺 x-codex-installation-id + 非收敛 session」的
-		// 形态暴露在上游眼里。账号关闭收敛（off）时返回 nil，探测保持原样。
-		if fpIDs := resolveCodexFingerprintIDsFromRequest(account, req.Header); fpIDs != nil {
-			applyCodexFingerprintHeaders(req.Header, fpIDs)
+		if fingerprintIDs == nil {
+			fingerprintIDs = resolveCodexFingerprintIDsFromRequest(credentialAccount, req.Header, codexFingerprintDeploymentSeed(s.cfg))
+		}
+		applyCodexFingerprintHeaders(req.Header, fingerprintIDs)
+		if turnMetadata := gjson.GetBytes(payloadBytes, "client_metadata.x-codex-turn-metadata").String(); turnMetadata != "" {
+			req.Header.Set("x-codex-turn-metadata", turnMetadata)
 		}
 	}
 
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
 	account.ApplyHeaderOverrides(req.Header)
+	ensureOpenAIRemoteCompactionV2BetaFeature(req.Header)
+	if isOAuth {
+		enforceCodexIdentityHeadersWithUA(req.Header, credentialAccount.GetOpenAIUserAgent())
+		applyCodexFingerprintHeaders(req.Header, fingerprintIDs)
+	}
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := accountTestProxyURL(account)
+	if proxyErr != nil {
+		return s.sendErrorAndEnd(c, proxyErr.Error())
 	}
 
 	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
 	if err != nil {
 		if s.accountRepo != nil {
-			updates := buildOpenAICompactProbeExtraUpdates(nil, nil, err, false, time.Now())
-			_ = s.accountRepo.UpdateExtra(ctx, account.ID, updates)
+			updates := buildOpenAICompactProbeExtraUpdatesV2(nil, nil, err, openAIProbeVerdictUnknown, openAICompactProbeReadError(err), probeStartedAt, time.Now().UTC())
+			_ = persistOpenAIProbeExtra(ctx, s.accountRepo, account.ID, updates)
 			mergeAccountExtra(account, updates)
 		}
 		return s.sendErrorAndEnd(c, fmt.Sprintf("Request failed: %s", err.Error()))
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	body, readErr := readOpenAIProbeBody(resp.Body, openAICompactProbeMaxBodyBytes)
 	body = redactAgentIdentitySensitiveBodyForAccount(ctx, s.accountRepo, credentialAccount, body)
-	if !agentIdentityTaskRecoveryWasTried(ctx) && credentialAccount.IsOpenAIAgentIdentity() && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, body) {
+	if readErr == nil && !agentIdentityTaskRecoveryWasTried(ctx) && credentialAccount.IsOpenAIAgentIdentity() && isAgentIdentityTaskInvalidHTTPResponse(resp.StatusCode, body) {
 		expectedTaskID := credentialAccount.GetCredential("task_id")
 		if err := ensureAgentIdentityTaskForAccount(ctx, s.accountRepo, s.agentIdentityWS, &s.agentIdentityTaskMu, credentialAccount, expectedTaskID); err != nil {
 			return s.sendErrorAndEnd(c, fmt.Sprintf("Agent Identity task recovery failed: %s", err.Error()))
@@ -2142,32 +2185,46 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 		return s.testOpenAICompactConnection(c, account, testModelID)
 	}
 
-	compactionFound := openAICompactProbeFoundCompactionItem(body)
+	verdict, verdictReason := evaluateOpenAICompactProbeHTTP(resp, body)
+	if readErr != nil {
+		verdict = openAIProbeVerdictUnknown
+		verdictReason = openAICompactProbeReadError(readErr)
+	}
 	if s.accountRepo != nil {
-		updates := buildOpenAICompactProbeExtraUpdates(resp, body, nil, compactionFound, time.Now())
-		if codexUpdates, err := extractOpenAICodexProbeUpdates(resp); err == nil && len(codexUpdates) > 0 {
-			updates = mergeExtraUpdates(updates, codexUpdates)
-		}
+		updates := buildOpenAICompactProbeExtraUpdatesV2(resp, body, readErr, verdict, verdictReason, probeStartedAt, time.Now().UTC())
 		if len(updates) > 0 {
-			_ = s.accountRepo.UpdateExtra(ctx, account.ID, updates)
+			_ = persistOpenAIProbeExtra(ctx, s.accountRepo, account.ID, updates)
 			mergeAccountExtra(account, updates)
 		}
-		// 探测如返回 429,主动同步限流状态,避免后续短时间内继续选中。
+		if codexUpdates, extractErr := extractOpenAICodexProbeUpdates(resp); extractErr == nil && len(codexUpdates) > 0 {
+			if persistErr := persistOpenAIProbeExtra(ctx, s.accountRepo, account.ID, codexUpdates); persistErr == nil {
+				mergeAccountExtra(account, codexUpdates)
+			}
+		}
 		if resp.StatusCode == http.StatusTooManyRequests {
 			s.reconcileOpenAI429State(ctx, account, resp.Header, body)
 		}
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
 		if resp.StatusCode == http.StatusUnauthorized && s.accountRepo != nil {
 			errMsg := fmt.Sprintf("Authentication failed (401): %s", string(body))
 			_ = s.accountRepo.SetError(ctx, account.ID, errMsg)
 		}
 		return s.sendErrorAndEnd(c, fmt.Sprintf("API returned %d: %s", resp.StatusCode, string(body)))
 	}
+	if s.rateLimitService != nil {
+		s.rateLimitService.clearOpenAIOAuth429Streak(account.ID)
+	}
 
-	if !compactionFound {
-		return s.sendErrorAndEnd(c, "Upstream returned 2xx without a compaction output item (native remote compaction v2 unsupported on this chain)")
+	if readErr != nil {
+		return s.sendErrorAndEnd(c, verdictReason)
+	}
+	if verdict != openAIProbeVerdictSupported {
+		if verdictReason == "" {
+			verdictReason = "native remote compaction v2 probe was inconclusive"
+		}
+		return s.sendErrorAndEnd(c, verdictReason)
 	}
 
 	s.sendEvent(c, TestEvent{Type: "content", Text: "Compact probe succeeded (native remote compaction v2)"})
@@ -2177,6 +2234,10 @@ func (s *AccountTestService) testOpenAICompactConnection(c *gin.Context, account
 
 func (s *AccountTestService) reconcileOpenAI429State(ctx context.Context, account *Account, headers http.Header, body []byte) {
 	if s == nil || s.accountRepo == nil || account == nil {
+		return
+	}
+	if s.rateLimitService != nil {
+		s.rateLimitService.HandleUpstreamError(ctx, account, http.StatusTooManyRequests, headers, body)
 		return
 	}
 
@@ -2888,9 +2949,9 @@ func (s *AccountTestService) testOpenAIImageAPIKey(c *gin.Context, ctx context.C
 	// 账号级请求头覆写：测试请求与真实转发保持一致的最终头
 	account.ApplyHeaderOverrides(req.Header)
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := accountTestProxyURL(account)
+	if proxyErr != nil {
+		return s.sendErrorAndEnd(c, proxyErr.Error())
 	}
 
 	resp, err := s.httpUpstream.DoWithTLS(req, proxyURL, account.ID, account.Concurrency, s.tlsFPProfileService.ResolveTLSProfile(account))
@@ -3002,21 +3063,13 @@ func (s *AccountTestService) testOpenAIImageOAuth(c *gin.Context, ctx context.Co
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "text/event-stream")
 	req.Header.Set("OpenAI-Beta", "responses=experimental")
-	canonical := resolveCodexOutboundIdentity("")
-	req.Header.Set("originator", canonical.originator)
-	if customUA := strings.TrimSpace(credentialAccount.GetOpenAIUserAgent()); customUA != "" {
-		req.Header.Set("User-Agent", customUA)
-	} else {
-		req.Header.Set("User-Agent", canonical.userAgent)
-	}
+	applyOpenAICodexProbeHeaders(req.Header)
 	setOpenAIChatGPTAccountHeaders(req.Header, credentialAccount)
-	// 与真实转发一致：账号级自定义 UA 同样作为管理员显式配置传入，否则测试用的身份
-	// 与该账号真实出站的身份不是同一个（issue #3901 的配对不变式由收口保证）。
 	enforceCodexIdentityHeadersWithUA(req.Header, credentialAccount.GetOpenAIUserAgent())
 
-	proxyURL := ""
-	if account.ProxyID != nil && account.Proxy != nil {
-		proxyURL = account.Proxy.URL()
+	proxyURL, proxyErr := accountTestProxyURL(account)
+	if proxyErr != nil {
+		return s.sendErrorAndEnd(c, proxyErr.Error())
 	}
 	resp, err := s.httpUpstream.Do(req, proxyURL, account.ID, account.Concurrency)
 	if err != nil {

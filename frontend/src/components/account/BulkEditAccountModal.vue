@@ -974,12 +974,13 @@
       </div>
 
       <!-- Codex 指纹收敛模式（仅 OpenAI OAuth） -->
-      <div v-if="allOpenAIOAuth" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+      <div v-if="allOpenAIOAuthOnly" class="border-t border-gray-200 pt-4 dark:border-dark-600">
         <div class="mb-3 flex items-center justify-between">
           <label class="input-label mb-0">{{ t('admin.accounts.openai.codexFingerprintMode') }}</label>
           <input
             v-model="enableCodexFingerprintMode"
             type="checkbox"
+            data-testid="bulk-codex-fingerprint-mode-enabled"
             class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
           />
         </div>
@@ -988,6 +989,61 @@
             {{ t('admin.accounts.openai.codexFingerprintModeDesc') }}
           </p>
           <Select v-model="codexFingerprintMode" data-testid="bulk-codex-fingerprint-mode-select" :options="codexFingerprintModeOptions" />
+        </div>
+      </div>
+
+      <!-- 奸商模式（严格仅 OpenAI OAuth） -->
+      <div v-if="allOpenAIOAuthOnly" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+        <div class="mb-3 flex items-center justify-between">
+          <label class="input-label mb-0" for="bulk-edit-codex-429-guard-enabled">
+            {{ t('admin.accounts.codex429Guard') }}
+          </label>
+          <input
+            id="bulk-edit-codex-429-guard-enabled"
+            v-model="enableCodex429Guard"
+            type="checkbox"
+            class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+          />
+        </div>
+        <div
+          class="flex items-center justify-between gap-4"
+          :class="!enableCodex429Guard && 'pointer-events-none opacity-50'"
+        >
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            {{ t('admin.accounts.codex429GuardHint') }}
+          </p>
+          <Toggle
+            v-model="codex429GuardEnabled"
+            data-testid="bulk-edit-codex-429-guard-toggle"
+          />
+        </div>
+      </div>
+
+      <!-- Antigravity paid overages -->
+      <div v-if="allTargetsAntigravity" class="border-t border-gray-200 pt-4 dark:border-dark-600">
+        <div class="mb-3 flex items-center justify-between">
+          <label class="input-label mb-0" for="bulk-edit-allow-overages-enabled">
+            {{ t('admin.accounts.allowOverages') }}
+          </label>
+          <input
+            id="bulk-edit-allow-overages-enabled"
+            v-model="enableAllowOverages"
+            type="checkbox"
+            class="rounded border-gray-300 text-primary-600 focus:ring-primary-500"
+          />
+        </div>
+        <div
+          class="flex items-center justify-between gap-4"
+          :class="!enableAllowOverages && 'pointer-events-none opacity-50'"
+        >
+          <p class="text-xs text-gray-500 dark:text-gray-400">
+            {{ t('admin.accounts.allowOveragesTooltip') }}
+          </p>
+          <Toggle
+            :model-value="allowOveragesEnabled"
+            data-testid="bulk-edit-allow-overages-toggle"
+            @update:model-value="handleBulkAllowOveragesChange"
+          />
         </div>
       </div>
 
@@ -1488,6 +1544,7 @@ import type {
 import BaseDialog from '@/components/common/BaseDialog.vue'
 import ConfirmDialog from '@/components/common/ConfirmDialog.vue'
 import Select from '@/components/common/Select.vue'
+import Toggle from '@/components/common/Toggle.vue'
 import ProxySelector from '@/components/common/ProxySelector.vue'
 import GroupSelector from '@/components/common/GroupSelector.vue'
 import ModelWhitelistSelector from '@/components/account/ModelWhitelistSelector.vue'
@@ -1526,6 +1583,7 @@ interface Props {
     previewCount?: number
     selectedPlatforms?: AccountPlatform[]
     selectedTypes?: AccountType[]
+    hasCredentialShadows?: boolean
   }
   proxies: ProxyConfig[]
   groups: AdminGroup[]
@@ -1545,6 +1603,7 @@ const targetMode = computed(() => props.target?.mode ?? 'selected')
 const targetPreviewCount = computed(() => props.target?.previewCount ?? props.accountIds.length)
 const targetSelectedPlatforms = computed(() => props.target?.selectedPlatforms ?? props.selectedPlatforms)
 const targetSelectedTypes = computed(() => props.target?.selectedTypes ?? props.selectedTypes)
+const targetHasCredentialShadows = computed(() => props.target?.hasCredentialShadows === true)
 // Grok 快捷端点仅在所选账号全部为 grok 平台时展示（其他平台不显示）
 const allTargetsGrok = computed(
   () =>
@@ -1552,6 +1611,11 @@ const allTargetsGrok = computed(
     targetSelectedPlatforms.value.every((p) => p === 'grok')
 )
 const isMixedPlatform = computed(() => targetSelectedPlatforms.value.length > 1)
+const allTargetsAntigravity = computed(
+  () =>
+    targetSelectedPlatforms.value.length === 1 &&
+    targetSelectedPlatforms.value[0] === 'antigravity'
+)
 
 const allOpenAIPassthroughCapable = computed(() => {
   return (
@@ -1574,6 +1638,7 @@ const allOpenAIOAuth = computed(() => {
 // 严格 OAuth（不含 setup-token）：namespace 摊平兼容开关只对 OAuth 账号生效
 const allOpenAIOAuthOnly = computed(() => {
   return (
+    !targetHasCredentialShadows.value &&
     targetSelectedPlatforms.value.length === 1 &&
     targetSelectedPlatforms.value[0] === 'openai' &&
     targetSelectedTypes.value.length > 0 &&
@@ -1666,6 +1731,9 @@ const enableOpenAIAPIKeyWSMode = ref(false)
 const enableUpstreamBillingAutoProbe = ref(false)
 const enableCodexCLIOnly = ref(false)
 const enableCodexCLIOnlyAppServer = ref(false)
+const enableCodexFingerprintMode = ref(false)
+const enableCodex429Guard = ref(false)
+const enableAllowOverages = ref(false)
 const enableOpenAICompactMode = ref(false)
 const enableOpenAICompactModelMapping = ref(false)
 const enableRpmLimit = ref(false)
@@ -1706,8 +1774,19 @@ const upstreamBillingAutoProbeMode = ref<'enabled' | 'disabled'>('enabled')
 const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
-const enableCodexFingerprintMode = ref(false)
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
+const codex429GuardEnabled = ref(false)
+const allowOveragesEnabled = ref(false)
+
+const handleBulkAllowOveragesChange = (enabled: boolean) => {
+  if (!enabled) {
+    allowOveragesEnabled.value = false
+    return
+  }
+  // A bulk selection may contain paid Pro accounts. Use the stronger warning
+  // because the lightweight selection metadata intentionally excludes secrets.
+  allowOveragesEnabled.value = window.confirm(t('admin.accounts.allowOveragesProConfirm'))
+}
 const codexFingerprintModeOptions = computed(() => [
   { value: 'off' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintOff') },
   { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') },
@@ -2087,13 +2166,25 @@ const buildUpdatePayload = (): Record<string, unknown> | null => {
     extra.codex_cli_only_allow_app_server = codexCLIOnlyAppServerEnabled.value
   }
 
-  if (enableCodexFingerprintMode.value) {
+  if (enableCodexFingerprintMode.value && allOpenAIOAuthOnly.value) {
     const extra = ensureExtra()
-    // off = 默认值，清键即可；device/session/full 是显式 opt-in，必须落键（#5610）。
-    if (codexFingerprintMode.value !== 'off') {
-      extra.codex_fingerprint_mode = codexFingerprintMode.value
-    } else {
-      delete extra.codex_fingerprint_mode
+    // Bulk updates use JSONB merge semantics; null explicitly clears a
+    // previous account-level override while off remains the default.
+    extra.codex_fingerprint_mode = codexFingerprintMode.value === 'off'
+      ? null
+      : codexFingerprintMode.value
+  }
+
+  if (enableCodex429Guard.value && allOpenAIOAuthOnly.value) {
+    const extra = ensureExtra()
+    extra.openai_codex_429_guard_enabled = codex429GuardEnabled.value
+  }
+
+  if (enableAllowOverages.value && allTargetsAntigravity.value) {
+    const extra = ensureExtra()
+    extra.allow_overages = allowOveragesEnabled.value
+    if (allowOveragesEnabled.value) {
+      updates.confirm_overages_risk = true
     }
   }
 
@@ -2211,6 +2302,8 @@ const handleSubmit = async () => {
     enableCodexCLIOnly.value ||
     enableCodexCLIOnlyAppServer.value ||
     enableCodexFingerprintMode.value ||
+    enableCodex429Guard.value ||
+    enableAllowOverages.value ||
     enableOpenAICompactMode.value ||
     enableOpenAICompactModelMapping.value ||
     enableRpmLimit.value ||
@@ -2363,6 +2456,10 @@ watch(
       enableCodexCLIOnlyAppServer.value = false
       enableCodexFingerprintMode.value = false
       codexFingerprintMode.value = 'off'
+      enableCodex429Guard.value = false
+      codex429GuardEnabled.value = false
+      enableAllowOverages.value = false
+      allowOveragesEnabled.value = false
       enableOpenAICompactMode.value = false
       enableOpenAICompactModelMapping.value = false
       enableRpmLimit.value = false

@@ -128,28 +128,31 @@ type CreateAccountRequest struct {
 	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
 	ProbeEnabled            *bool          `json:"upstream_billing_probe_enabled"`
 	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	ConfirmOveragesRisk     *bool          `json:"confirm_overages_risk"`
 }
 
 // UpdateAccountRequest represents update account request
 // 使用指针类型来区分"未提供"和"设置为0"
 type UpdateAccountRequest struct {
-	Name                    string         `json:"name"`
-	Notes                   *string        `json:"notes"`
-	Type                    string         `json:"type" binding:"omitempty,oneof=oauth setup-token apikey upstream bedrock service_account"`
-	Credentials             map[string]any `json:"credentials"`
-	Extra                   map[string]any `json:"extra"`
-	ProxyID                 *int64         `json:"proxy_id"`
-	Concurrency             *int           `json:"concurrency"`
-	Priority                *int           `json:"priority"`
-	RateMultiplier          *float64       `json:"rate_multiplier"`
-	LoadFactor              *int           `json:"load_factor"`
-	Status                  string         `json:"status" binding:"omitempty,oneof=active inactive error"`
-	GroupIDs                *[]int64       `json:"group_ids"`
-	ExpiresAt               *int64         `json:"expires_at"`
-	AutoPauseOnExpired      *bool          `json:"auto_pause_on_expired"`
-	ProbeEnabled            *bool          `json:"upstream_billing_probe_enabled"`
-	RateSyncEnabled         *bool          `json:"upstream_billing_rate_sync_enabled"`
-	ConfirmMixedChannelRisk *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	Name                        string         `json:"name"`
+	Notes                       *string        `json:"notes"`
+	Type                        string         `json:"type" binding:"omitempty,oneof=oauth setup-token apikey upstream bedrock service_account"`
+	Credentials                 map[string]any `json:"credentials"`
+	Extra                       map[string]any `json:"extra"`
+	CodexFingerprintModeTouched *bool          `json:"codex_fingerprint_mode_touched"`
+	ProxyID                     *int64         `json:"proxy_id"`
+	Concurrency                 *int           `json:"concurrency"`
+	Priority                    *int           `json:"priority"`
+	RateMultiplier              *float64       `json:"rate_multiplier"`
+	LoadFactor                  *int           `json:"load_factor"`
+	Status                      string         `json:"status" binding:"omitempty,oneof=active inactive error"`
+	GroupIDs                    *[]int64       `json:"group_ids"`
+	ExpiresAt                   *int64         `json:"expires_at"`
+	AutoPauseOnExpired          *bool          `json:"auto_pause_on_expired"`
+	ProbeEnabled                *bool          `json:"upstream_billing_probe_enabled"`
+	RateSyncEnabled             *bool          `json:"upstream_billing_rate_sync_enabled"`
+	ConfirmMixedChannelRisk     *bool          `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	ConfirmOveragesRisk         *bool          `json:"confirm_overages_risk"`
 }
 
 // BulkUpdateAccountsRequest represents the payload for bulk editing accounts
@@ -169,6 +172,7 @@ type BulkUpdateAccountsRequest struct {
 	Extra                   map[string]any            `json:"extra"`
 	ProbeEnabled            *bool                     `json:"upstream_billing_probe_enabled"`
 	ConfirmMixedChannelRisk *bool                     `json:"confirm_mixed_channel_risk"` // 用户确认混合渠道风险
+	ConfirmOveragesRisk     *bool                     `json:"confirm_overages_risk"`
 }
 
 type BulkUpdateAccountFilters struct {
@@ -197,6 +201,15 @@ type AccountWithConcurrency struct {
 	CurrentWindowCost *float64 `json:"current_window_cost,omitempty"` // 当前窗口费用
 	ActiveSessions    *int     `json:"active_sessions,omitempty"`     // 当前活跃会话数
 	CurrentRPM        *int     `json:"current_rpm,omitempty"`         // 当前分钟 RPM 计数
+}
+
+type AccountLiteResponse struct {
+	ID                 int64  `json:"id"`
+	Name               string `json:"name"`
+	Platform           string `json:"platform"`
+	Type               string `json:"type"`
+	ParentAccountID    *int64 `json:"parent_account_id,omitempty"`
+	AccountHealthProbe any    `json:"account_health_probe,omitempty"`
 }
 
 type AccountSchedulerScore struct {
@@ -538,6 +551,24 @@ func (h *AccountHandler) List(c *gin.Context) {
 		response.ErrorFrom(c, err)
 		return
 	}
+	if lite {
+		result := make([]AccountLiteResponse, len(accounts))
+		for index := range accounts {
+			account := &accounts[index]
+			result[index] = AccountLiteResponse{
+				ID:              account.ID,
+				Name:            account.Name,
+				Platform:        account.Platform,
+				Type:            account.Type,
+				ParentAccountID: account.ParentAccountID,
+			}
+			if account.Extra != nil {
+				result[index].AccountHealthProbe = account.Extra[service.AccountHealthProbeExtraKey]
+			}
+		}
+		response.Paginated(c, result, total, page, pageSize)
+		return
+	}
 	if h.ollamaCloudUsage != nil && len(accounts) > 0 {
 		accountPointers := make([]*service.Account, len(accounts))
 		for index := range accounts {
@@ -863,6 +894,7 @@ func (h *AccountHandler) Create(c *gin.Context) {
 			AutoPauseOnExpired:    req.AutoPauseOnExpired,
 			ProbeEnabled:          req.ProbeEnabled,
 			SkipMixedChannelCheck: skipCheck,
+			ConfirmOveragesRisk:   req.ConfirmOveragesRisk != nil && *req.ConfirmOveragesRisk,
 		})
 		if execErr != nil {
 			return nil, execErr
@@ -975,23 +1007,25 @@ func (h *AccountHandler) Update(c *gin.Context) {
 	skipCheck := req.ConfirmMixedChannelRisk != nil && *req.ConfirmMixedChannelRisk
 
 	account, err := h.adminService.UpdateAccount(c.Request.Context(), accountID, &service.UpdateAccountInput{
-		Name:                  req.Name,
-		Notes:                 req.Notes,
-		Type:                  req.Type,
-		Credentials:           req.Credentials,
-		Extra:                 req.Extra,
-		ProxyID:               req.ProxyID,
-		Concurrency:           req.Concurrency, // 指针类型，nil 表示未提供
-		Priority:              req.Priority,    // 指针类型，nil 表示未提供
-		RateMultiplier:        req.RateMultiplier,
-		LoadFactor:            req.LoadFactor,
-		Status:                req.Status,
-		GroupIDs:              req.GroupIDs,
-		ExpiresAt:             req.ExpiresAt,
-		AutoPauseOnExpired:    req.AutoPauseOnExpired,
-		ProbeEnabled:          req.ProbeEnabled,
-		RateSyncEnabled:       req.RateSyncEnabled,
-		SkipMixedChannelCheck: skipCheck,
+		Name:                        req.Name,
+		Notes:                       req.Notes,
+		Type:                        req.Type,
+		Credentials:                 req.Credentials,
+		Extra:                       req.Extra,
+		CodexFingerprintModeTouched: req.CodexFingerprintModeTouched,
+		ProxyID:                     req.ProxyID,
+		Concurrency:                 req.Concurrency, // 指针类型，nil 表示未提供
+		Priority:                    req.Priority,    // 指针类型，nil 表示未提供
+		RateMultiplier:              req.RateMultiplier,
+		LoadFactor:                  req.LoadFactor,
+		Status:                      req.Status,
+		GroupIDs:                    req.GroupIDs,
+		ExpiresAt:                   req.ExpiresAt,
+		AutoPauseOnExpired:          req.AutoPauseOnExpired,
+		ProbeEnabled:                req.ProbeEnabled,
+		RateSyncEnabled:             req.RateSyncEnabled,
+		SkipMixedChannelCheck:       skipCheck,
+		ConfirmOveragesRisk:         req.ConfirmOveragesRisk != nil && *req.ConfirmOveragesRisk,
 	})
 	if err != nil {
 		// 检查是否为混合渠道错误
@@ -1072,6 +1106,64 @@ type TestAccountRequest struct {
 	AudioDataURL string `json:"audio_data_url"`
 }
 
+type BatchHealthProbeRequest struct {
+	AccountIDs []int64 `json:"account_ids" binding:"required,min=1,max=200,dive,gt=0"`
+}
+
+type BatchHealthProbeResponse struct {
+	Results []service.AccountHealthProbeResult `json:"results"`
+	Healthy int                                `json:"healthy"`
+	Failed  int                                `json:"failed"`
+	Skipped int                                `json:"skipped"`
+}
+
+type BatchInventoryResponse struct {
+	Results      []service.AccountInventoryResult `json:"results"`
+	Healthy      int                              `json:"healthy"`
+	Failed       int                              `json:"failed"`
+	Skipped      int                              `json:"skipped"`
+	QuotaFetched int                              `json:"quota_fetched"`
+}
+
+func (h *AccountHandler) ListHealthProbeFailures(c *gin.Context) {
+	if h == nil || h.adminService == nil {
+		response.ErrorFrom(c, infraerrors.InternalServer("ACCOUNT_HEALTH_SERVICE_UNAVAILABLE", "account health service is unavailable"))
+		return
+	}
+	const pageSize = 1000
+	results := make([]service.AccountHealthProbeResult, 0)
+	for page := 1; ; page++ {
+		accounts, total, err := h.adminService.ListAccounts(c.Request.Context(), page, pageSize, service.PlatformOpenAI, "", "", "", 0, "", "id", "asc")
+		if err != nil {
+			response.ErrorFrom(c, err)
+			return
+		}
+		for index := range accounts {
+			account := &accounts[index]
+			snapshot := account.HealthProbeSnapshot()
+			if snapshot == nil || snapshot.Status != service.AccountHealthProbeStatusFailed {
+				continue
+			}
+			results = append(results, service.AccountHealthProbeResult{
+				AccountID:       account.ID,
+				Name:            account.Name,
+				Platform:        account.Platform,
+				Type:            account.Type,
+				Dead:            true,
+				Attempts:        snapshot.Attempts,
+				Mode:            snapshot.Mode,
+				Reason:          snapshot.Reason,
+				Snapshot:        snapshot,
+				HealthPersisted: true,
+			})
+		}
+		if int64(page*pageSize) >= total {
+			break
+		}
+	}
+	response.Success(c, results)
+}
+
 type SyncFromCRSRequest struct {
 	BaseURL            string   `json:"base_url" binding:"required"`
 	Username           string   `json:"username" binding:"required"`
@@ -1115,6 +1207,131 @@ func (h *AccountHandler) Test(c *gin.Context) {
 			_ = c.Error(err)
 		}
 	}
+}
+
+// BatchHealthProbe checks OpenAI accounts using their native account type:
+// OAuth uses the quota/reset-credit endpoints; API Key uses a real connection test.
+func (h *AccountHandler) BatchHealthProbe(c *gin.Context) {
+	var req BatchHealthProbeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	if hasDuplicateAccountIDs(req.AccountIDs) {
+		response.BadRequest(c, "account_ids must not contain duplicate IDs")
+		return
+	}
+	if h.accountTestService == nil {
+		response.Error(c, http.StatusServiceUnavailable, "Account health service unavailable")
+		return
+	}
+
+	result := BatchHealthProbeResponse{Results: make([]service.AccountHealthProbeResult, len(req.AccountIDs))}
+	probeCtx := c.Request.Context()
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for index, accountID := range req.AccountIDs {
+		index, accountID := index, accountID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-probeCtx.Done():
+				result.Results[index] = canceledAccountHealthProbeResult(accountID, probeCtx.Err())
+				return
+			}
+			defer func() { <-sem }()
+			result.Results[index] = h.accountTestService.ProbeOpenAIAccountHealth(probeCtx, accountID)
+		}()
+	}
+	wg.Wait()
+	for _, item := range result.Results {
+		switch {
+		case item.Healthy:
+			result.Healthy++
+		case item.Dead:
+			result.Failed++
+		default:
+			result.Skipped++
+		}
+	}
+	response.Success(c, result)
+}
+
+// BatchInventory probes only the selected accounts and includes ChatGPT quota
+// data for OpenAI OAuth accounts. API Key accounts report connection health
+// without a quota payload; unsupported platforms are returned as skipped.
+func (h *AccountHandler) BatchInventory(c *gin.Context) {
+	var req BatchHealthProbeRequest
+	if err := c.ShouldBindJSON(&req); err != nil {
+		response.BadRequest(c, "Invalid request: "+err.Error())
+		return
+	}
+	if hasDuplicateAccountIDs(req.AccountIDs) {
+		response.BadRequest(c, "account_ids must not contain duplicate IDs")
+		return
+	}
+	if h.accountTestService == nil {
+		response.Error(c, http.StatusServiceUnavailable, "Account inventory service unavailable")
+		return
+	}
+
+	result := BatchInventoryResponse{Results: make([]service.AccountInventoryResult, len(req.AccountIDs))}
+	probeCtx := c.Request.Context()
+	sem := make(chan struct{}, 8)
+	var wg sync.WaitGroup
+	for index, accountID := range req.AccountIDs {
+		index, accountID := index, accountID
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-probeCtx.Done():
+				result.Results[index] = service.AccountInventoryResult{
+					AccountHealthProbeResult: canceledAccountHealthProbeResult(accountID, probeCtx.Err()),
+				}
+				return
+			}
+			defer func() { <-sem }()
+			result.Results[index] = h.accountTestService.InventoryOpenAIAccount(probeCtx, accountID)
+		}()
+	}
+	wg.Wait()
+	for _, item := range result.Results {
+		switch {
+		case item.Healthy:
+			result.Healthy++
+		case item.Dead:
+			result.Failed++
+		default:
+			result.Skipped++
+		}
+		if item.Quota != nil {
+			result.QuotaFetched++
+		}
+	}
+	response.Success(c, result)
+}
+
+func hasDuplicateAccountIDs(accountIDs []int64) bool {
+	seen := make(map[int64]struct{}, len(accountIDs))
+	for _, accountID := range accountIDs {
+		if _, exists := seen[accountID]; exists {
+			return true
+		}
+		seen[accountID] = struct{}{}
+	}
+	return false
+}
+
+func canceledAccountHealthProbeResult(accountID int64, err error) service.AccountHealthProbeResult {
+	reason := "account probe canceled"
+	if err != nil {
+		reason = err.Error()
+	}
+	return service.AccountHealthProbeResult{AccountID: accountID, Reason: reason}
 }
 
 // RecoverState handles unified recovery of recoverable account runtime state.
@@ -1915,6 +2132,7 @@ func (h *AccountHandler) BatchCreate(c *gin.Context) {
 				ExpiresAt:             item.ExpiresAt,
 				AutoPauseOnExpired:    item.AutoPauseOnExpired,
 				SkipMixedChannelCheck: skipCheck,
+				ConfirmOveragesRisk:   item.ConfirmOveragesRisk != nil && *item.ConfirmOveragesRisk,
 			})
 			if err != nil {
 				failed++
@@ -2129,6 +2347,7 @@ func (h *AccountHandler) BulkUpdate(c *gin.Context) {
 		Extra:                 req.Extra,
 		ProbeEnabled:          req.ProbeEnabled,
 		SkipMixedChannelCheck: skipCheck,
+		ConfirmOveragesRisk:   req.ConfirmOveragesRisk != nil && *req.ConfirmOveragesRisk,
 	})
 	if err != nil {
 		var mixedErr *service.MixedChannelError

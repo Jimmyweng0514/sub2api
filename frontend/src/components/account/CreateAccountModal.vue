@@ -3170,6 +3170,25 @@
         </div>
       </div>
 
+      <!-- 奸商模式（仅 OpenAI OAuth） -->
+      <div
+        v-if="form.platform === 'openai' && form.type === 'oauth'"
+        class="border-t border-gray-200 pt-4 dark:border-dark-600"
+      >
+        <div class="flex items-center justify-between gap-4">
+          <div class="min-w-0">
+            <label class="input-label mb-0">{{ t('admin.accounts.codex429Guard') }}</label>
+            <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+              {{ t('admin.accounts.codex429GuardHint') }}
+            </p>
+          </div>
+          <Toggle
+            v-model="codex429GuardEnabled"
+            data-testid="create-codex-429-guard-toggle"
+          />
+        </div>
+      </div>
+
       <!-- OpenAI Compact 能力配置 -->
       <div
         v-if="form.platform === 'openai' && (accountCategory === 'oauth-based' || accountCategory === 'apikey')"
@@ -3321,7 +3340,9 @@
           <label class="flex cursor-pointer items-center gap-2">
             <input
               type="checkbox"
-              v-model="allowOverages"
+              :checked="allowOverages"
+              @change="handleAllowOveragesChange"
+              data-testid="allow-overages-toggle"
               class="h-4 w-4 rounded border-gray-300 text-primary-500 focus:ring-primary-500 dark:border-dark-500"
             />
             <span class="text-sm font-medium text-gray-700 dark:text-gray-300">
@@ -3776,6 +3797,7 @@ import {
 } from '@/components/account/credentialsBuilder'
 import { formatDateTimeLocalInput, parseDateTimeLocalInput } from '@/utils/format'
 import { createStableObjectKeyResolver } from '@/utils/stableObjectKey'
+import { isAntigravityProTier } from '@/utils/antigravityOverages'
 import { VERTEX_LOCATION_OPTIONS } from '@/constants/account'
 import {
   OPENAI_WS_MODE_CTX_POOL,
@@ -4173,6 +4195,7 @@ const codexCLIOnlyEnabled = ref(false)
 const codexCLIOnlyAppServerEnabled = ref(false)
 type CodexFingerprintMode = 'off' | 'device' | 'session' | 'full'
 const codexFingerprintMode = ref<CodexFingerprintMode>('off')
+const codex429GuardEnabled = ref(false)
 const codexFingerprintModeOptions = computed(() => [
   { value: 'off' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintOff') },
   { value: 'device' as CodexFingerprintMode, label: t('admin.accounts.openai.codexFingerprintDevice') },
@@ -4204,6 +4227,36 @@ adminAPI.settings.getWebSearchEmulationConfig().then(cfg => {
 loadQuotaNotifyGlobal()
 const mixedScheduling = ref(false) // For antigravity accounts: enable mixed scheduling
 const allowOverages = ref(false) // For antigravity accounts: enable AI Credits overages
+const proOveragesConfirmed = ref(false)
+
+function handleAllowOveragesChange(event: Event) {
+  const input = event.target as HTMLInputElement
+  const enabled = input.checked
+  if (!enabled) {
+    allowOverages.value = false
+    proOveragesConfirmed.value = false
+    return
+  }
+  allowOverages.value = confirm(t('admin.accounts.allowOveragesConfirm'))
+  input.checked = allowOverages.value
+}
+
+const ensureProOveragesConfirmed = (
+  platform: AccountPlatform,
+  credentials: Record<string, unknown>,
+  extra?: Record<string, unknown>
+) => {
+  if (
+    platform !== 'antigravity' ||
+    extra?.allow_overages !== true ||
+    !isAntigravityProTier(credentials, extra) ||
+    proOveragesConfirmed.value
+  ) {
+    return true
+  }
+  proOveragesConfirmed.value = window.confirm(t('admin.accounts.allowOveragesProConfirm'))
+  return proOveragesConfirmed.value
+}
 const antigravityAccountType = ref<'oauth' | 'upstream'>('oauth') // For antigravity: oauth or upstream
 const antigravityProjectId = ref('')
 const upstreamBaseUrl = ref('') // For upstream type: base URL
@@ -4925,13 +4978,19 @@ const openMixedChannelDialog = (opts: {
 }
 
 const withAntigravityConfirmFlag = (payload: CreateAccountRequest): CreateAccountRequest => {
+  const confirmedPayload: CreateAccountRequest = { ...payload }
+  if (payload.platform === 'antigravity' && payload.extra?.allow_overages === true) {
+    confirmedPayload.confirm_overages_risk = true
+  } else {
+    delete confirmedPayload.confirm_overages_risk
+  }
   if (needsMixedChannelCheck(payload.platform) && antigravityMixedChannelConfirmed.value) {
     return {
-      ...payload,
+			...confirmedPayload,
       confirm_mixed_channel_risk: true
     }
   }
-  const cloned = { ...payload }
+	const cloned = { ...confirmedPayload }
   delete cloned.confirm_mixed_channel_risk
   return cloned
 }
@@ -4967,6 +5026,9 @@ const ensureAntigravityMixedChannelConfirmed = async (onConfirm: () => Promise<v
 }
 
 const submitCreateAccount = async (payload: CreateAccountRequest) => {
+  if (!ensureProOveragesConfirmed(payload.platform, payload.credentials, payload.extra)) {
+    return
+  }
   submitting.value = true
   try {
     const account = await adminAPI.accounts.create(withAntigravityConfirmFlag(payload))
@@ -5066,6 +5128,7 @@ const resetForm = () => {
   codexCLIOnlyEnabled.value = false
   codexCLIOnlyAppServerEnabled.value = false
   codexFingerprintMode.value = 'off'
+  codex429GuardEnabled.value = false
   anthropicPassthroughEnabled.value = false
   anthropicAPIKeyAuthScheme.value = 'x_api_key'
   webSearchEmulationMode.value = 'default'
@@ -5089,6 +5152,7 @@ const resetForm = () => {
   customBaseUrlEnabled.value = false
   customBaseUrl.value = ''
   allowOverages.value = false
+  proOveragesConfirmed.value = false
   antigravityAccountType.value = 'oauth'
   antigravityProjectId.value = ''
   upstreamBaseUrl.value = ''
@@ -5164,12 +5228,20 @@ const buildOpenAIExtra = (base?: Record<string, unknown>): Record<string, unknow
   } else {
     delete extra.codex_cli_only_allow_app_server
   }
-  // 收敛是显式 opt-in：off 即默认值，不落键；device/session/full 必须显式写入，
-  // 否则管理员的选择会被当成默认而丢失（#5610）。
-  if (codexFingerprintMode.value !== 'off') {
+  // Fingerprint convergence is opt-in. Keep off implicit, and persist all
+  // explicit modes so the backend can project the selected lifecycle.
+  if (form.type === 'oauth' && codexFingerprintMode.value !== 'off') {
     extra.codex_fingerprint_mode = codexFingerprintMode.value
   } else {
     delete extra.codex_fingerprint_mode
+    delete extra.codex_fingerprint_seed
+    delete extra.openai_device_id
+    delete extra.openai_session_id
+  }
+  if (form.type === 'oauth') {
+    extra.openai_codex_429_guard_enabled = codex429GuardEnabled.value
+  } else {
+    delete extra.openai_codex_429_guard_enabled
   }
   if (openAICompactMode.value !== 'auto') {
     extra.openai_compact_mode = openAICompactMode.value
@@ -6397,14 +6469,19 @@ const handleAntigravityValidateRT = async (refreshTokenInput: string) => {
         // Generate account name with index for batch
         const accountName = refreshTokens.length > 1 ? `${form.name} #${i + 1}` : form.name
 
-        // Note: Antigravity doesn't have buildExtraInfo, so we pass empty extra or rely on credentials
+        const extra = buildAntigravityExtra()
+        if (!ensureProOveragesConfirmed('antigravity', credentials, extra)) {
+          failedCount += refreshTokens.length - i
+          errors.push(`#${i + 1}: paid overages confirmation canceled`)
+          break
+        }
         const createPayload = withAntigravityConfirmFlag({
           name: accountName,
           notes: form.notes,
           platform: 'antigravity',
           type: 'oauth',
           credentials,
-          extra: {},
+          extra,
           proxy_id: form.proxy_id,
           concurrency: form.concurrency,
           load_factor: form.load_factor ?? undefined,

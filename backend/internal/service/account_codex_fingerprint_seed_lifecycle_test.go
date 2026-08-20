@@ -37,6 +37,23 @@ func TestAdminCreateAccountStripsUserSeedAndCreatesFreshSeedWhenEnabled(t *testi
 	require.Equal(t, "session", created.Extra[codexFingerprintModeExtraKey])
 }
 
+func TestAdminCreateAccountIgnoresMalformedUserSeed(t *testing.T) {
+	created, err := (&adminServiceImpl{accountRepo: &upstreamBillingProbeAccountRepo{}}).CreateAccount(context.Background(), &CreateAccountInput{
+		Name:                 "codex-oauth-malformed-seed",
+		Platform:             PlatformOpenAI,
+		Type:                 AccountTypeOAuth,
+		SkipDefaultGroupBind: true,
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey: "device",
+			codexFingerprintSeedExtraKey: []string{"not-a-uuid"},
+		},
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, "device", created.Extra[codexFingerprintModeExtraKey])
+	requireValidCodexFingerprintSeed(t, created.Extra)
+}
+
 func TestAdminUpdateAccountPreservesExistingSeedAndStripsUserSeed(t *testing.T) {
 	accountID := int64(201)
 	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{
@@ -85,11 +102,15 @@ func TestAdminUpdateAccountInitializesSeedWhenFullEditEnables(t *testing.T) {
 	}}
 
 	updated, err := (&adminServiceImpl{accountRepo: repo}).UpdateAccount(context.Background(), accountID, &UpdateAccountInput{
-		Extra: map[string]any{codexFingerprintModeExtraKey: "device"},
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey: "device",
+			codexFingerprintSeedExtraKey: []string{"not-a-uuid"},
+		},
 	})
 
 	require.NoError(t, err)
-	require.NotEqual(t, "not-a-seed", requireValidCodexFingerprintSeed(t, updated.Extra))
+	seed := requireValidCodexFingerprintSeed(t, updated.Extra)
+	require.NotEqual(t, "not-a-seed", seed)
 	require.Equal(t, "device", updated.Extra[codexFingerprintModeExtraKey])
 }
 
@@ -122,6 +143,37 @@ func TestAdminUpdateAccountDisableReenablePreservesValidSeed(t *testing.T) {
 	require.Equal(t, testCodexFingerprintSeed, requireValidCodexFingerprintSeed(t, reenabled.Extra))
 }
 
+func TestAdminUpdateAccountTypeTransitionMintsFreshCodexSeed(t *testing.T) {
+	accountID := int64(205)
+	legacySeed := testCodexFingerprintSeed
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{
+		accountID: {
+			ID:       accountID,
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Status:   StatusActive,
+			Extra: map[string]any{
+				codexFingerprintSeedExtraKey: legacySeed,
+				"openai_device_id":           "legacy-device",
+			},
+		},
+	}}
+
+	updated, err := (&adminServiceImpl{accountRepo: repo}).UpdateAccount(context.Background(), accountID, &UpdateAccountInput{
+		Type: AccountTypeOAuth,
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey: "session",
+			codexFingerprintSeedExtraKey: userSuppliedCodexFingerprintSeed,
+		},
+	})
+
+	require.NoError(t, err)
+	seed := requireValidCodexFingerprintSeed(t, updated.Extra)
+	require.NotEqual(t, legacySeed, seed)
+	require.NotEqual(t, userSuppliedCodexFingerprintSeed, seed)
+	require.NotContains(t, updated.Extra, "openai_device_id")
+}
+
 func TestAdminUpdateAccountExtraStripsSeedAndLeavesAtomicEnsureToRepository(t *testing.T) {
 	accountID := int64(204)
 	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{
@@ -144,14 +196,44 @@ func TestAdminUpdateAccountExtraStripsSeedAndLeavesAtomicEnsureToRepository(t *t
 	require.NotContains(t, repo.updates[accountID][0], codexFingerprintSeedExtraKey)
 }
 
+func TestAdminUpdateAccountExtraIgnoresSeedOnlyOnNonOAuthAccount(t *testing.T) {
+	accountID := int64(206)
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{
+		accountID: {
+			ID:       accountID,
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeAPIKey,
+			Extra:    map[string]any{"keep": "value"},
+		},
+	}}
+
+	err := (&adminServiceImpl{accountRepo: repo}).UpdateAccountExtra(context.Background(), accountID, map[string]any{
+		codexFingerprintSeedExtraKey: []string{"not-a-uuid"},
+	})
+
+	require.NoError(t, err)
+	require.Empty(t, repo.updates)
+}
+
 func TestBulkUpdateAccountsDoesNotPrewriteCodexSeed(t *testing.T) {
-	repo := &upstreamBillingProbeAccountRepo{}
+	repo := &upstreamBillingProbeAccountRepo{accounts: map[int64]*Account{
+		301: {
+			ID:       301,
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeOAuth,
+		},
+		302: {
+			ID:       302,
+			Platform: PlatformOpenAI,
+			Type:     AccountTypeOAuth,
+		},
+	}}
 
 	result, err := (&adminServiceImpl{accountRepo: repo}).BulkUpdateAccounts(context.Background(), &BulkUpdateAccountsInput{
 		AccountIDs: []int64{301, 302},
 		Extra: map[string]any{
 			codexFingerprintModeExtraKey: "session",
-			codexFingerprintSeedExtraKey: userSuppliedCodexFingerprintSeed,
+			codexFingerprintSeedExtraKey: []string{"not-a-uuid"},
 		},
 	})
 
@@ -192,7 +274,7 @@ func TestDuplicateAccountDoesNotCopyCodexFingerprintSeed(t *testing.T) {
 	require.NoError(t, err)
 	require.NotEqual(t, source.ID, duplicate.ID)
 	require.NotContains(t, duplicate.Extra, codexFingerprintSeedExtraKey)
-	require.Equal(t, "session", duplicate.Extra[codexFingerprintModeExtraKey])
+	require.NotContains(t, duplicate.Extra, codexFingerprintModeExtraKey)
 }
 
 func TestDuplicateCreatePathMintsFreshSeedWhenEligible(t *testing.T) {

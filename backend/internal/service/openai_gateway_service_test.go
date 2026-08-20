@@ -125,6 +125,7 @@ func TestOpenAIGatewayService_ForwardAsAnthropic_CapacityShedReturnsRequestScope
 	c.Request.Header.Set("Content-Type", "application/json")
 
 	upstreamBody := []byte(`{"error":{"message":"Our servers are currently overloaded. Please try again later."}}`)
+	require.True(t, isOpenAIRequestScopedCapacityShed("", upstreamBody))
 	upstream := &httpUpstreamRecorder{responses: []*http.Response{
 		{
 			StatusCode: http.StatusBadRequest,
@@ -151,6 +152,7 @@ func TestOpenAIGatewayService_ForwardAsAnthropic_CapacityShedReturnsRequestScope
 		httpUpstream:     upstream,
 		rateLimitService: rateLimitService,
 	}
+	require.True(t, svc.shouldFailoverOpenAIUpstreamResponse(http.StatusBadRequest, "Our servers are currently overloaded. Please try again later.", upstreamBody))
 	account := &Account{
 		ID: 5099, Name: "temporary-unschedulable", Platform: PlatformOpenAI,
 		Type: AccountTypeAPIKey, Concurrency: 1,
@@ -622,6 +624,16 @@ func TestOpenAIGatewayService_GenerateSessionHash_ContentFallback(t *testing.T) 
 	bodyDifferent := []byte(`{"model":"gpt-5.4","messages":[{"role":"user","content":"Different question"}]}`)
 	hashDifferent := svc.GenerateSessionHash(c, bodyDifferent)
 	require.NotEqual(t, hash, hashDifferent, "different content should produce different hash")
+}
+
+func TestOpenAIGatewayService_GenerateSessionHash_ModelOnlyFallsThrough(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	rec := httptest.NewRecorder()
+	c, _ := gin.CreateTestContext(rec)
+	c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+
+	svc := &OpenAIGatewayService{}
+	require.Empty(t, svc.GenerateSessionHash(c, []byte(`{"model":"gpt-5.1"}`)))
 }
 
 func TestOpenAIGatewayService_GenerateSessionHash_ExplicitSignalWinsOverContent(t *testing.T) {
@@ -1164,7 +1176,7 @@ func TestOpenAISelectAccountWithLoadAwareness_StickyWaitPlan(t *testing.T) {
 	}
 }
 
-func TestOpenAISelectAccountWithLoadAwareness_PrefersLowerLoad(t *testing.T) {
+func TestOpenAISelectAccountWithLoadAwareness_PrefersActiveAccountWithCapacity(t *testing.T) {
 	groupID := int64(1)
 	repo := stubOpenAIAccountRepo{
 		accounts: []Account{
@@ -1175,8 +1187,8 @@ func TestOpenAISelectAccountWithLoadAwareness_PrefersLowerLoad(t *testing.T) {
 	cache := &stubGatewayCache{}
 	concurrencyCache := stubConcurrencyCache{
 		loadMap: map[int64]*AccountLoadInfo{
-			1: {AccountID: 1, LoadRate: 80},
-			2: {AccountID: 2, LoadRate: 10},
+			1: {AccountID: 1, CurrentConcurrency: 0, LoadRate: 0},
+			2: {AccountID: 2, CurrentConcurrency: 0, LoadRate: 0},
 		},
 	}
 
@@ -1190,10 +1202,10 @@ func TestOpenAISelectAccountWithLoadAwareness_PrefersLowerLoad(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SelectAccountWithLoadAwareness error: %v", err)
 	}
-	if selection == nil || selection.Account == nil || selection.Account.ID != 2 {
-		t.Fatalf("expected account 2")
+	if selection == nil || selection.Account == nil || selection.Account.ID != 1 {
+		t.Fatalf("expected stable first idle account 1")
 	}
-	if cache.sessionBindings["openai:load"] != 2 {
+	if cache.sessionBindings["openai:load"] != 1 {
 		t.Fatalf("expected sticky session updated")
 	}
 }
@@ -1381,8 +1393,8 @@ func TestOpenAISelectAccountWithLoadAwareness_MissingLoadInfo(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SelectAccountWithLoadAwareness error: %v", err)
 	}
-	if selection == nil || selection.Account == nil || selection.Account.ID != 2 {
-		t.Fatalf("expected account 2")
+	if selection == nil || selection.Account == nil || selection.Account.ID != 1 {
+		t.Fatalf("expected stable first idle account 1")
 	}
 }
 
@@ -1411,7 +1423,7 @@ func TestOpenAISelectAccountForModelWithExclusions_LeastRecentlyUsed(t *testing.
 	}
 }
 
-func TestOpenAISelectAccountWithLoadAwareness_PreferNeverUsed(t *testing.T) {
+func TestOpenAISelectAccountWithLoadAwareness_PrefersStableIdleAccount(t *testing.T) {
 	groupID := int64(1)
 	lastUsed := time.Now().Add(-1 * time.Hour)
 	repo := stubOpenAIAccountRepo{
@@ -1438,8 +1450,8 @@ func TestOpenAISelectAccountWithLoadAwareness_PreferNeverUsed(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SelectAccountWithLoadAwareness error: %v", err)
 	}
-	if selection == nil || selection.Account == nil || selection.Account.ID != 2 {
-		t.Fatalf("expected account 2")
+	if selection == nil || selection.Account == nil || selection.Account.ID != 1 {
+		t.Fatalf("expected stable first idle account 1")
 	}
 }
 
@@ -2892,7 +2904,11 @@ func TestOpenAIValidateUpstreamBaseURLEnabledEnforcesAllowlist(t *testing.T) {
 
 func TestOpenAIUpdateCodexUsageSnapshotFromHeaders(t *testing.T) {
 	repo := &snapshotUpdateAccountRepo{updateExtraCalls: make(chan map[string]any, 1)}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	// 独立零间隔节流器：避免 -count>1 时落入包级 30s 默认节流窗口而偶发失败。
+	svc := &OpenAIGatewayService{
+		accountRepo:           repo,
+		codexSnapshotThrottle: newAccountWriteThrottle(0),
+	}
 	headers := http.Header{}
 	headers.Set("x-codex-primary-used-percent", "12")
 	headers.Set("x-codex-secondary-used-percent", "34")
@@ -2954,7 +2970,7 @@ func TestNormalizeOpenAICompactRequestBodyPreservesCurrentCodexPayloadFields(t *
 	require.Equal(t, "resp_123", gjson.GetBytes(normalized, "previous_response_id").String())
 	require.False(t, gjson.GetBytes(normalized, "store").Exists())
 	require.False(t, gjson.GetBytes(normalized, "stream").Exists())
-	require.False(t, gjson.GetBytes(normalized, "prompt_cache_key").Exists())
+	require.Equal(t, "cache_123", gjson.GetBytes(normalized, "prompt_cache_key").String())
 }
 
 func TestOpenAIBuildUpstreamRequestOpenAIPassthroughPreservesCompactPath(t *testing.T) {
@@ -3070,6 +3086,8 @@ func TestOpenAIBuildUpstreamRequestPreservesCodexIdentityHeaders(t *testing.T) {
 	c.Request.Header.Set("User-Agent", "codex_cli_rs/0.144.1")
 	c.Request.Header.Set("X-Codex-Window-ID", "window-http")
 	c.Request.Header.Set("X-Codex-Installation-ID", "installation-http")
+	c.Request.Header.Set("X-Codex-Parent-Thread-ID", "parent-http")
+	c.Request.Header.Set("X-OpenAI-Subagent", "collab_spawn")
 	c.Request.Header.Set("X-Test", "blocked")
 
 	body := []byte(`{"model":"gpt-5","input":"hello"}`)
@@ -3084,6 +3102,8 @@ func TestOpenAIBuildUpstreamRequestPreservesCodexIdentityHeaders(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, "window-http", req.Header.Get("X-Codex-Window-ID"))
 	require.Equal(t, "installation-http", req.Header.Get("X-Codex-Installation-ID"))
+	require.Equal(t, "parent-http", req.Header.Get("X-Codex-Parent-Thread-ID"))
+	require.Equal(t, "collab_spawn", req.Header.Get("X-OpenAI-Subagent"))
 	require.Empty(t, req.Header.Get("X-Test"))
 	require.True(t, openai.EvaluateEngineFingerprint(req.Header, body, openai.DefaultEngineFingerprintSignals))
 }

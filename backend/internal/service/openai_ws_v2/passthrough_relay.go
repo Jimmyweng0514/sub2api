@@ -432,6 +432,10 @@ func Relay(
 	return result, nil
 }
 
+// isClientResponseCreateFrame treats text and binary WebSocket frames
+// identically at the protocol layer. Codex clients may choose either wire
+// representation for a JSON response.create event; routing and lifecycle
+// bookkeeping must not depend on the frame encoding.
 func isClientResponseCreateFrame(msgType coderws.MessageType, payload []byte) bool {
 	if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
 		return false

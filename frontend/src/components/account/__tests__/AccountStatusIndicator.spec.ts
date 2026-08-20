@@ -51,6 +51,25 @@ function makeAccount(overrides: Partial<Account>): Account {
 }
 
 describe('AccountStatusIndicator', () => {
+  it('shows persisted health-probe failures as dead with the reason', () => {
+    const account = makeAccount({
+      platform: 'openai',
+      type: 'apikey',
+      extra: {
+        account_health_probe: {
+          status: 'failed',
+          mode: 'openai_apikey_connection',
+          attempts: 2,
+          checked_at: '2026-08-13T00:00:00Z',
+          reason: 'API returned 401'
+        }
+      }
+    })
+
+    const wrapper = mount(AccountStatusIndicator, { props: { account } })
+    expect(wrapper.text()).toContain('admin.accounts.status.healthDead')
+    expect(wrapper.text()).toContain('API returned 401')
+  })
   it('Claude 5 模型限流时显示 Opus 和 Sonnet 的短别名', () => {
     const wrapper = mount(AccountStatusIndicator, {
       props: {
@@ -221,5 +240,52 @@ describe('AccountStatusIndicator', () => {
     expect(wrapper.text()).not.toContain('⚡')
     // AICredits 积分耗尽状态应显示
     expect(wrapper.text()).toContain('admin.accounts.status.creditsExhausted')
+  })
+
+  it('缺失 status 时显示 unknown 兜底而不是原始 i18n 键名', () => {
+    const wrapper = mount(AccountStatusIndicator, {
+      props: {
+        // 精简列表等局部对象可能缺少 status 字段
+        account: makeAccount({ status: undefined as unknown as Account['status'] })
+      },
+      global: {
+        stubs: {
+          Icon: true
+        }
+      }
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.status.unknown')
+    expect(wrapper.text()).not.toContain('admin.accounts.status.undefined')
+  })
+
+  it('未知 status 值同样走 unknown 兜底', () => {
+    const wrapper = mount(AccountStatusIndicator, {
+      props: {
+        account: makeAccount({ status: 'mystery' as unknown as Account['status'] })
+      },
+      global: {
+        stubs: {
+          Icon: true
+        }
+      }
+    })
+
+    expect(wrapper.text()).toContain('admin.accounts.status.unknown')
+    expect(wrapper.text()).not.toContain('admin.accounts.status.mystery')
+  })
+
+  it('domain 历史值 disabled 与 expired 显示对应文案而不是 unknown', () => {
+    const disabled = mount(AccountStatusIndicator, {
+      props: { account: makeAccount({ status: 'disabled' }) },
+      global: { stubs: { Icon: true } }
+    })
+    expect(disabled.text()).toContain('admin.accounts.status.disabled')
+
+    const expired = mount(AccountStatusIndicator, {
+      props: { account: makeAccount({ status: 'expired' }) },
+      global: { stubs: { Icon: true } }
+    })
+    expect(expired.text()).toContain('admin.accounts.status.expired')
   })
 })

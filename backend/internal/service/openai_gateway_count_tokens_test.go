@@ -99,6 +99,10 @@ func TestOpenAIGatewayService_ForwardCountTokensAsAnthropic_OAuthFallsBackWhenPl
 			"access_token":  "oauth-token",
 			"refresh_token": "oauth-refresh-token",
 		},
+		Extra: map[string]any{
+			codexFingerprintModeExtraKey: string(codexFingerprintDevice),
+			codexFingerprintSeedExtraKey: "11111111-1111-4111-8111-111111111111",
+		},
 		Status:      StatusActive,
 		Schedulable: true,
 	}
@@ -163,6 +167,14 @@ func TestOpenAIGatewayService_ForwardCountTokensAsAnthropic_OAuthFallsBackWhenPl
 			require.Equal(t, "https://api.openai.com/v1/responses/input_tokens", upstream.lastReq.URL.String())
 			require.Equal(t, "Bearer oauth-token", upstream.lastReq.Header.Get("authorization"))
 			require.Empty(t, upstream.lastReq.Header.Get("Chatgpt-Account-Id"))
+			// input_tokens is not a Codex Responses lifecycle request. It must not
+			// receive any of the four fingerprint-convergence projections.
+			require.Empty(t, upstream.lastReq.Header.Get("x-codex-installation-id"))
+			require.Empty(t, upstream.lastReq.Header.Get("session_id"), "device mode does not invent a session")
+			require.Empty(t, upstream.lastReq.Header.Get("conversation_id"), "device mode does not invent a conversation")
+			require.Empty(t, upstream.lastReq.Header.Get("x-client-request-id"), "device mode does not invent a request id")
+			require.Empty(t, upstream.lastReq.Header.Get("originator"))
+			require.Empty(t, upstream.lastReq.Header.Get("version"))
 			require.Zero(t, repo.tempUnschedCalls, "OAuth input_tokens unsupported errors must not temp-unschedule the account")
 			require.Zero(t, repo.setErrorCalls, "OAuth input_tokens unsupported errors must not mark the account error")
 		})

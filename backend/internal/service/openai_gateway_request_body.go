@@ -304,8 +304,9 @@ func isOpenAIEncryptedReasoningInputItem(item any) bool {
 	return has
 }
 
-// IsOpenAIResponsesCompactPath reports whether the request targets the legacy
-// /responses/compact endpoint, including its forwardable subpaths.
+// IsOpenAIResponsesCompactPath reports whether the current request targets the
+// legacy /responses/compact wire. Native remote compaction v2 stays on
+// /responses and must not be classified as legacy compact traffic.
 func IsOpenAIResponsesCompactPath(c *gin.Context) bool {
 	return isOpenAIResponsesCompactPath(c)
 }
@@ -329,8 +330,9 @@ func normalizeOpenAICompactRequestBody(body []byte) ([]byte, bool, error) {
 	}
 
 	normalized := []byte(`{}`)
-	// Keep the current Codex /compact schema while still dropping request-scoped
-	// fields such as prompt_cache_key, store, and stream.
+	// Keep the current Codex /compact schema while dropping request-scoped fields
+	// such as store and stream. prompt_cache_key is part of the Codex identity
+	// domain and must remain aligned with the session.
 	for _, field := range []string{
 		"model",
 		"input",
@@ -339,6 +341,9 @@ func normalizeOpenAICompactRequestBody(body []byte) ([]byte, bool, error) {
 		"parallel_tool_calls",
 		"reasoning",
 		"service_tier",
+		// Codex uses this key as the cache/session domain for both normal
+		// Responses and the legacy compact endpoint.
+		"prompt_cache_key",
 		"text",
 		"previous_response_id",
 	} {

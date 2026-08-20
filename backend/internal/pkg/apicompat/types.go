@@ -339,12 +339,17 @@ func (t *ResponsesTool) UnmarshalJSON(data []byte) error {
 
 // ResponsesResponse is the non-streaming response from POST /v1/responses.
 type ResponsesResponse struct {
-	ID     string            `json:"id"`
-	Object string            `json:"object"` // "response"
-	Model  string            `json:"model"`
-	Status string            `json:"status"` // "completed" | "incomplete" | "failed"
-	Output []ResponsesOutput `json:"output"`
-	Usage  *ResponsesUsage   `json:"usage,omitempty"`
+	ID     string `json:"id"`
+	Object string `json:"object"` // "response"
+	// CreatedAt is the unix creation timestamp. Strict Responses clients declare
+	// it non-optional and abort with `missing field 'created_at'` when it is
+	// absent, so it is always emitted — no omitempty. Same rule as ID (see the
+	// "clients treat it as required" fallback in ChatCompletionsResponseToAnthropic).
+	CreatedAt int64             `json:"created_at"`
+	Model     string            `json:"model"`
+	Status    string            `json:"status"` // "completed" | "incomplete" | "failed"
+	Output    []ResponsesOutput `json:"output"`
+	Usage     *ResponsesUsage   `json:"usage,omitempty"`
 
 	// incomplete_details is present when status="incomplete"
 	IncompleteDetails *ResponsesIncompleteDetails `json:"incomplete_details,omitempty"`
@@ -714,7 +719,9 @@ type ChatToolCall struct {
 
 // ChatFunctionCall contains the function name and arguments.
 type ChatFunctionCall struct {
-	Name      string `json:"name"`
+	// Empty name is omitted so streamed arguments-only deltas never overwrite
+	// the tool name a client accumulated from the first delta.
+	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
 }
 

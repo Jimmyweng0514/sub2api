@@ -295,7 +295,7 @@ func TestIsOpenAITransientProcessingError(t *testing.T) {
 
 	require.True(t, isOpenAITransientProcessingError(
 		http.StatusServiceUnavailable,
-		"Server is overloaded. Please try again later.",
+		"Our servers are currently overloaded. Please try again later.",
 		nil,
 	))
 
@@ -343,6 +343,7 @@ func TestShouldFailoverOpenAIUpstreamResponseContextWindow502(t *testing.T) {
 
 func TestOpenAIGatewayService_Forward_LogsInstructionsRequiredDetails(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	proxyID := int64(8301)
 	logSink, restore := captureStructuredLog(t)
 	defer restore()
 
@@ -375,6 +376,8 @@ func TestOpenAIGatewayService_Forward_LogsInstructionsRequiredDetails(t *testing
 		Platform:       PlatformOpenAI,
 		Type:           AccountTypeAPIKey,
 		Concurrency:    1,
+		ProxyID:        &proxyID,
+		Proxy:          &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 		Credentials:    map[string]any{"api_key": "sk-test"},
 		Status:         StatusActive,
 		Schedulable:    true,
@@ -402,6 +405,7 @@ func TestOpenAIGatewayService_Forward_LogsInstructionsRequiredDetails(t *testing
 
 func TestOpenAIGatewayService_Forward_TransientProcessingErrorTriggersFailover(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	proxyID := int64(8302)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -431,6 +435,8 @@ func TestOpenAIGatewayService_Forward_TransientProcessingErrorTriggersFailover(t
 		Platform:       PlatformOpenAI,
 		Type:           AccountTypeAPIKey,
 		Concurrency:    1,
+		ProxyID:        &proxyID,
+		Proxy:          &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 		Credentials:    map[string]any{"api_key": "sk-test"},
 		Status:         StatusActive,
 		Schedulable:    true,
@@ -450,6 +456,7 @@ func TestOpenAIGatewayService_Forward_TransientProcessingErrorTriggersFailover(t
 
 func TestOpenAIGatewayService_Forward_ModelCapacityErrorTriggersFailoverAndSameAccountRetry(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+	proxyID := int64(8303)
 
 	rec := httptest.NewRecorder()
 	c, _ := gin.CreateTestContext(rec)
@@ -479,6 +486,8 @@ func TestOpenAIGatewayService_Forward_ModelCapacityErrorTriggersFailoverAndSameA
 		Platform:    PlatformOpenAI,
 		Type:        AccountTypeAPIKey,
 		Concurrency: 1,
+		ProxyID:     &proxyID,
+		Proxy:       &Proxy{ID: proxyID, Protocol: "http", Host: "127.0.0.1", Port: 1080},
 		Credentials: map[string]any{
 			"api_key":   "sk-test",
 			"pool_mode": true,

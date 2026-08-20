@@ -102,7 +102,8 @@ func TestOpenAIGatewayService_Forward_WSv2ErrorEventUsageLimitPersistsRateLimit(
 			return
 		}
 		_ = conn.WriteJSON(map[string]any{
-			"type": "error",
+			"type":        "error",
+			"status_code": http.StatusTooManyRequests,
 			"error": map[string]any{
 				"code":      "rate_limit_exceeded",
 				"type":      "usage_limit_reached",
@@ -146,6 +147,7 @@ func TestOpenAIGatewayService_Forward_WSv2ErrorEventUsageLimitPersistsRateLimit(
 			"responses_websockets_v2_enabled": true,
 		},
 	}
+	openAITestAccountWithProxyForURL(&account, wsServer.URL)
 	repo := &openAIWSRateLimitSignalRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}}}
 	rateSvc := &RateLimitService{accountRepo: repo}
 	svc := &OpenAIGatewayService{
@@ -166,6 +168,224 @@ func TestOpenAIGatewayService_Forward_WSv2ErrorEventUsageLimitPersistsRateLimit(
 	require.Nil(t, upstream.lastReq, "WS 限流 error event 不应回退到同账号 HTTP")
 	require.Len(t, repo.rateLimitCalls, 1)
 	require.WithinDuration(t, time.Unix(resetAt, 0), repo.rateLimitCalls[0], 2*time.Second)
+}
+
+func TestOpenAIGatewayService_ForwardWSv2Confirmed429StatusOnlyKeepsLease(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := newOpenAIWSV2TestConfig()
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"error","status_code":429,"error":{"message":"quota reached"}}`),
+		[]byte(`{"type":"response.completed","response":{"id":"resp_guard_after_429","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          5031,
+		Name:        "openai-codex-429-v2-lease",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	openAITestAccountWithProxy(account)
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	// Seed and pin the socket before the account enters the runtime block. The
+	// guard only retains an existing healthy connection; a socket opened after
+	// the block must take the normal failover path.
+	oldConn := newOpenAIWSConn("guard_status_old_conn", account.ID, captureConn, nil)
+	oldConn.handshakeCompatibility = normalizeOpenAIWSHandshakeCompatibility(http.Header{
+		"x-codex-beta-features": []string{openAIRemoteCompactionV2Feature},
+	})
+	ap := pool.getOrCreateAccountPool(account.ID)
+	ap.mu.Lock()
+	ap.conns[oldConn.id] = oldConn
+	ap.mu.Unlock()
+	require.True(t, pool.PinGuardConn(account.ID, oldConn.id))
+	stateStore := svc.getOpenAIWSStateStore()
+	stateStore.BindResponseConn("resp_guard_status_seed", oldConn.id, time.Hour)
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+
+	forward := func() (*OpenAIForwardResult, *httptest.ResponseRecorder, error) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+		c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+		requestBody := map[string]any{
+			"model":                "gpt-5.1",
+			"stream":               false,
+			"previous_response_id": "resp_guard_status_seed",
+			"input":                []any{map[string]any{"type": "input_text", "text": "hello"}},
+		}
+		agentTaskRecoveryTried := false
+		result, err := svc.forwardOpenAIWSV2(
+			context.Background(),
+			c,
+			account,
+			requestBody,
+			"access-token",
+			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+			true,
+			false,
+			"gpt-5.1",
+			"gpt-5.1",
+			time.Now(),
+			1,
+			"",
+			&agentTaskRecoveryTried,
+		)
+		return result, rec, err
+	}
+
+	firstResult, firstRec, firstErr := forward()
+	require.Error(t, firstErr)
+	require.Nil(t, firstResult)
+	require.Equal(t, http.StatusTooManyRequests, firstRec.Code)
+
+	secondResult, _, secondErr := forward()
+	require.NoError(t, secondErr)
+	require.NotNil(t, secondResult)
+	require.Equal(t, "resp_guard_after_429", secondResult.RequestID)
+	require.Equal(t, 0, captureDialer.DialCount(), "confirmed 429 must reuse the pre-existing guarded websocket")
+	require.Len(t, captureConn.writes, 2)
+}
+
+func TestOpenAIGatewayService_ForwardWSv2GuardAcquireQueueFullKeepsBinding(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	cfg := newOpenAIWSV2TestConfig()
+	cfg.Security.URLAllowlist.Enabled = false
+	cfg.Security.URLAllowlist.AllowInsecureHTTP = true
+	cfg.Gateway.OpenAIWS.MaxConnsPerAccount = 1
+	cfg.Gateway.OpenAIWS.MinIdlePerAccount = 0
+	cfg.Gateway.OpenAIWS.MaxIdlePerAccount = 1
+	cfg.Gateway.OpenAIWS.QueueLimitPerConn = 1
+
+	captureConn := &openAIWSCaptureConn{events: [][]byte{
+		[]byte(`{"type":"response.completed","response":{"id":"resp_guard_queue_seed","model":"gpt-5.1","usage":{"input_tokens":1,"output_tokens":1}}}`),
+	}}
+	captureDialer := &openAIWSCaptureDialer{conn: captureConn}
+	pool := newOpenAIWSConnPool(cfg)
+	pool.setClientDialerForTest(captureDialer)
+	defer pool.Close()
+
+	account := &Account{
+		ID:          5041,
+		Name:        "openai-codex-429-queue-full",
+		Platform:    PlatformOpenAI,
+		Type:        AccountTypeOAuth,
+		Status:      StatusActive,
+		Schedulable: true,
+		Concurrency: 1,
+		Credentials: map[string]any{"access_token": "access-token"},
+		Extra: map[string]any{
+			OpenAICodex429GuardEnabledExtraKey:             true,
+			"openai_oauth_responses_websockets_v2_enabled": true,
+		},
+	}
+	openAITestAccountWithProxy(account)
+	svc := &OpenAIGatewayService{
+		cfg:              cfg,
+		cache:            &stubGatewayCache{},
+		openaiWSResolver: NewOpenAIWSProtocolResolver(cfg),
+		toolCorrector:    NewCodexToolCorrector(),
+		openaiWSPool:     pool,
+	}
+	invoke := func(body map[string]any) (*OpenAIForwardResult, error) {
+		rec := httptest.NewRecorder()
+		c, _ := gin.CreateTestContext(rec)
+		c.Request = httptest.NewRequest(http.MethodPost, "/openai/v1/responses", nil)
+		c.Request.Header.Set("User-Agent", "codex_cli_rs/0.98.0")
+		recoveryTried := false
+		return svc.forwardOpenAIWSV2(
+			context.Background(),
+			c,
+			account,
+			body,
+			"access-token",
+			OpenAIWSProtocolDecision{Transport: OpenAIUpstreamTransportResponsesWebsocketV2},
+			true,
+			false,
+			"gpt-5.1",
+			"gpt-5.1",
+			time.Now(),
+			1,
+			"",
+			&recoveryTried,
+		)
+	}
+
+	seed, err := invoke(map[string]any{
+		"model":  "gpt-5.1",
+		"stream": false,
+		"input":  []any{map[string]any{"type": "input_text", "text": "seed"}},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, seed)
+	store := svc.getOpenAIWSStateStore()
+	connID, ok := store.GetResponseConn(seed.RequestID)
+	require.True(t, ok)
+	require.NotEmpty(t, connID)
+
+	svc.BlockAccountScheduling(account, time.Now().Add(time.Minute), "429")
+	snapshot := svc.openAIAccountRuntimeBlockSnapshot(account.ID)
+	require.True(t, snapshot.Active)
+	require.True(t, pool.MarkGuardConnConfirmed(account.ID, connID, snapshot.Generation))
+	require.True(t, svc.pinOpenAI429GuardConnection(account, connID))
+
+	ap, ok := pool.getAccountPool(account.ID)
+	require.True(t, ok)
+	ap.mu.Lock()
+	guardConn := ap.conns[connID]
+	ap.mu.Unlock()
+	require.NotNil(t, guardConn)
+	require.True(t, guardConn.tryAcquire(), "hold the guarded socket so Acquire returns queue-full")
+	guardConn.waiters.Store(1)
+	defer func() {
+		guardConn.waiters.Store(0)
+		guardConn.release()
+	}()
+
+	result, err := invoke(map[string]any{
+		"model":                "gpt-5.1",
+		"stream":               false,
+		"previous_response_id": seed.RequestID,
+		"input":                []any{map[string]any{"type": "input_text", "text": "next"}},
+	})
+	require.Error(t, err)
+	require.Nil(t, result)
+	var failoverErr *UpstreamFailoverError
+	require.NotErrorAs(t, err, &failoverErr, "a busy guard socket is not a connection failure")
+
+	boundAccountID, getErr := store.GetResponseAccount(context.Background(), 0, seed.RequestID)
+	require.NoError(t, getErr)
+	require.Equal(t, account.ID, boundAccountID)
+	boundConnID, stillBound := store.GetResponseConn(seed.RequestID)
+	require.True(t, stillBound)
+	require.Equal(t, connID, boundConnID)
+	require.True(t, pool.IsGuardConnPinned(account.ID, connID), "queue-full must not release a healthy guard pin")
 }
 
 func TestOpenAIGatewayService_Forward_WSv2Handshake429PersistsRateLimit(t *testing.T) {
@@ -216,6 +436,7 @@ func TestOpenAIGatewayService_Forward_WSv2Handshake429PersistsRateLimit(t *testi
 			"responses_websockets_v2_enabled": true,
 		},
 	}
+	openAITestAccountWithProxyForURL(&account, server.URL)
 	repo := &openAIWSRateLimitSignalRepo{stubOpenAIAccountRepo: stubOpenAIAccountRepo{accounts: []Account{account}}}
 	rateSvc := &RateLimitService{accountRepo: repo}
 	svc := &OpenAIGatewayService{
@@ -302,7 +523,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ErrorEventUsageL
 	resetAt := time.Now().Add(90 * time.Minute).Unix()
 	captureConn := &openAIWSCaptureConn{
 		events: [][]byte{
-			[]byte(`{"type":"error","error":{"code":"rate_limit_exceeded","type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":PLACEHOLDER}}`),
+			[]byte(`{"type":"error","status_code":429,"error":{"code":"rate_limit_exceeded","type":"usage_limit_reached","message":"The usage limit has been reached","resets_at":PLACEHOLDER}}`),
 		},
 	}
 	captureConn.events[0] = []byte(strings.ReplaceAll(string(captureConn.events[0]), "PLACEHOLDER", strconv.FormatInt(resetAt, 10)))
@@ -366,7 +587,7 @@ func TestOpenAIGatewayService_ProxyResponsesWebSocketFromClient_ErrorEventUsageL
 			return
 		}
 
-		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, &account, "sk-test", firstMessage, nil)
+		serverErrCh <- svc.ProxyResponsesWebSocketFromClient(r.Context(), ginCtx, conn, openAITestAccountWithProxy(&account), "sk-test", firstMessage, nil)
 	}))
 	defer wsServer.Close()
 
@@ -399,7 +620,11 @@ func TestOpenAIGatewayService_UpdateCodexUsageSnapshot_ExhaustedSnapshotDoesNotS
 		updateExtraCh: make(chan map[string]any, 1),
 		rateLimitCh:   make(chan time.Time, 1),
 	}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	// 独立零间隔节流器：避免 -count>1 时落入包级 30s 默认节流窗口而偶发失败。
+	svc := &OpenAIGatewayService{
+		accountRepo:           repo,
+		codexSnapshotThrottle: newAccountWriteThrottle(0),
+	}
 	snapshot := &OpenAICodexUsageSnapshot{
 		PrimaryUsedPercent:         ptrFloat64WS(100),
 		PrimaryResetAfterSeconds:   ptrIntWS(3600),
@@ -429,7 +654,11 @@ func TestOpenAIGatewayService_UpdateCodexUsageSnapshot_NonExhaustedSnapshotDoesN
 		updateExtraCh: make(chan map[string]any, 1),
 		rateLimitCh:   make(chan time.Time, 1),
 	}
-	svc := &OpenAIGatewayService{accountRepo: repo}
+	// 独立零间隔节流器：避免 -count>1 时落入包级 30s 默认节流窗口而偶发失败。
+	svc := &OpenAIGatewayService{
+		accountRepo:           repo,
+		codexSnapshotThrottle: newAccountWriteThrottle(0),
+	}
 	snapshot := &OpenAICodexUsageSnapshot{
 		PrimaryUsedPercent:         ptrFloat64WS(94),
 		PrimaryResetAfterSeconds:   ptrIntWS(3600),
@@ -551,4 +780,55 @@ func TestAdminService_ListAccounts_ExhaustedCodexExtraDoesNotSetRateLimit(t *tes
 func TestOpenAIWSErrorHTTPStatusFromRaw_UsageLimitReachedIs429(t *testing.T) {
 	require.Equal(t, http.StatusTooManyRequests, openAIWSErrorHTTPStatusFromRaw("", "usage_limit_reached"))
 	require.Equal(t, http.StatusTooManyRequests, openAIWSErrorHTTPStatusFromRaw("rate_limit_exceeded", ""))
+}
+
+func TestIsOpenAIWSRateLimitErrorRecognizesExplicit429TransportText(t *testing.T) {
+	message := "exceeded retry limit, last status: 429 Too Many Requests"
+	require.True(t, isOpenAIWSRateLimitError("", "", message))
+	require.True(t, isOpenAIWSRateLimitError("", "", "429 Too Many Requests"))
+	require.False(t, isOpenAIWSRateLimitError("", "", "retry attempt 429 exhausted"))
+	require.Equal(t, http.StatusTooManyRequests, openAIWSErrorHTTPStatusFromRawWithMessage("", "", message))
+}
+
+func TestIsOpenAIWSRateLimitSignalPrefersExplicitStatus(t *testing.T) {
+	require.True(t, isOpenAIWSRateLimitSignal(http.StatusTooManyRequests, "", "", ""))
+	require.True(t, isOpenAIWSRateLimitSignal(0, "rate_limit_exceeded", "", ""))
+	require.False(t, isOpenAIWSRateLimitSignal(http.StatusBadGateway, "rate_limit_exceeded", "", ""))
+	require.False(t, isOpenAIWSRateLimitSignal(http.StatusServiceUnavailable, "", "usage_limit_reached", ""))
+}
+
+func TestOpenAIWSPayloadUpstreamStatusIncludesTopLevelFields(t *testing.T) {
+	require.Equal(t, http.StatusTooManyRequests, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","status_code":429}`)))
+	require.Equal(t, http.StatusTooManyRequests, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","status":429}`)))
+	require.Equal(t, http.StatusBadGateway, openAIWSPayloadUpstreamStatus([]byte(`{"type":"error","error":{"status_code":502}}`)))
+}
+
+func TestPersistOpenAIWSRateLimitSignalWithoutRateLimitServiceConfirmsOAuth429(t *testing.T) {
+	account := &Account{ID: 9911, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	svc := &OpenAIGatewayService{}
+
+	for range 2 {
+		svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, []byte(`{"status":429}`), "rate_limit_exceeded", "", "quota reached")
+	}
+
+	require.True(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+}
+
+func TestPersistOpenAIWSRateLimitSignalIgnoresSemanticCodeWithoutExplicit429(t *testing.T) {
+	account := &Account{ID: 9912, Platform: PlatformOpenAI, Type: AccountTypeOAuth}
+	svc := &OpenAIGatewayService{}
+
+	for range 3 {
+		svc.persistOpenAIWSRateLimitSignal(context.Background(), account, nil, nil, "rate_limit_exceeded", "rate_limit_error", "quota reached")
+	}
+
+	require.False(t, svc.isOpenAI429GuardRuntimeBlocked(account))
+}
+
+func TestIsOpenAIWSExplicit429SignalRequiresStatusEvidence(t *testing.T) {
+	require.True(t, isOpenAIWSExplicit429Signal(http.StatusTooManyRequests, "usage_limit_reached", "", "", nil))
+	require.True(t, isOpenAIWSExplicit429Signal(0, "", "", "last status: 429 Too Many Requests", nil))
+	require.True(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "", []byte(`{"error":{"status":429}}`)))
+	require.False(t, isOpenAIWSExplicit429Signal(0, "usage_limit_reached", "", "quota reached", nil))
+	require.False(t, isOpenAIWSExplicit429Signal(0, "rate_limit_exceeded", "", "retry attempt 429 exhausted", nil))
 }

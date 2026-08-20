@@ -25,6 +25,7 @@ import (
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
 	"github.com/tidwall/gjson"
+	"github.com/tidwall/sjson"
 	"go.uber.org/zap"
 )
 
@@ -51,6 +52,187 @@ type openAIWSTurnChannelMappingSnapshot struct {
 }
 
 var errOpenAIWSUnsupportedModelSwitch = errors.New("selected account does not support websocket model switch")
+
+const openAIWSSubscriptionTurnSettlementTimeout = 10 * time.Second
+
+// openAIWSSubscriptionTurnLeaseState keeps a per-connection view of the
+// distributed subscription turn lease. The Redis lease rejects other sockets
+// immediately; this state lets a normal follow-up on the same socket wait for
+// its preceding accounting task instead of racing the old cache snapshot.
+type openAIWSSubscriptionTurnLeaseState struct {
+	mu     sync.Mutex
+	active *openAIWSSubscriptionTurnLease
+	byTurn map[int]*openAIWSSubscriptionTurnLease
+}
+
+type openAIWSSubscriptionTurnLease struct {
+	turn      int
+	lease     *service.SubscriptionUsageTurnLease
+	done      chan struct{}
+	settling  bool
+	releaseMu sync.Once
+}
+
+func newOpenAIWSSubscriptionTurnLeaseState() *openAIWSSubscriptionTurnLeaseState {
+	return &openAIWSSubscriptionTurnLeaseState{
+		byTurn: make(map[int]*openAIWSSubscriptionTurnLease),
+	}
+}
+
+func (s *openAIWSSubscriptionTurnLeaseState) acquire(
+	ctx context.Context,
+	billing *service.BillingCacheService,
+	userID, groupID int64,
+	turn int,
+) (bool, error) {
+	if s == nil || billing == nil || userID <= 0 || groupID <= 0 {
+		return true, nil
+	}
+	for {
+		s.mu.Lock()
+		existing := s.byTurn[turn]
+		if existing != nil && (existing.settling || existing.lease == nil || !existing.lease.Lost()) {
+			s.mu.Unlock()
+			return true, nil
+		}
+		if existing != nil {
+			s.mu.Unlock()
+			s.release(existing)
+			continue
+		}
+		active := s.active
+		s.mu.Unlock()
+
+		if active != nil {
+			waitCtx := ctx
+			if waitCtx == nil {
+				waitCtx = context.Background()
+			}
+			waitCtx, cancel := context.WithTimeout(waitCtx, openAIWSSubscriptionTurnSettlementTimeout)
+			select {
+			case <-active.done:
+				cancel()
+				continue
+			case <-waitCtx.Done():
+				cancel()
+				return false, waitCtx.Err()
+			}
+		}
+
+		lease, acquired, err := billing.AcquireSubscriptionUsageTurnLease(ctx, userID, groupID)
+		if err != nil || !acquired {
+			return acquired, err
+		}
+		held := &openAIWSSubscriptionTurnLease{
+			turn:  turn,
+			lease: lease,
+			done:  make(chan struct{}),
+		}
+
+		s.mu.Lock()
+		if s.active != nil {
+			s.mu.Unlock()
+			lease.Release()
+			continue
+		}
+		s.active = held
+		s.byTurn[turn] = held
+		s.mu.Unlock()
+		return true, nil
+	}
+}
+
+func (s *openAIWSSubscriptionTurnLeaseState) beginSettlement(turn int) *openAIWSSubscriptionTurnLease {
+	if s == nil {
+		return nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	held := s.byTurn[turn]
+	if held != nil {
+		held.settling = true
+	}
+	return held
+}
+
+func (s *openAIWSSubscriptionTurnLeaseState) hasTurn(turn int) bool {
+	if s == nil {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	held := s.byTurn[turn]
+	return held != nil && (held.settling || held.lease == nil || !held.lease.Lost())
+}
+
+func (s *openAIWSSubscriptionTurnLeaseState) releaseTurn(turn int) {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	held := s.byTurn[turn]
+	s.mu.Unlock()
+	s.release(held)
+}
+
+func (s *openAIWSSubscriptionTurnLeaseState) release(held *openAIWSSubscriptionTurnLease) {
+	if s == nil || held == nil {
+		return
+	}
+	held.releaseMu.Do(func() {
+		if held.lease != nil {
+			held.lease.Release()
+		}
+		s.mu.Lock()
+		if s.byTurn[held.turn] == held {
+			delete(s.byTurn, held.turn)
+		}
+		if s.active == held {
+			s.active = nil
+		}
+		close(held.done)
+		s.mu.Unlock()
+	})
+}
+
+func (s *openAIWSSubscriptionTurnLeaseState) abortUnsettled() {
+	if s == nil {
+		return
+	}
+	s.mu.Lock()
+	held := s.active
+	if held != nil && held.settling {
+		held = nil
+	}
+	s.mu.Unlock()
+	s.release(held)
+}
+
+func (s *openAIWSSubscriptionTurnLeaseState) settleAfterUsage(
+	held *openAIWSSubscriptionTurnLease,
+	billing *service.BillingCacheService,
+	userID, groupID int64,
+) {
+	if held == nil {
+		return
+	}
+	defer s.release(held)
+	if billing == nil {
+		return
+	}
+	settleCtx, cancel := context.WithTimeout(context.Background(), openAIWSSubscriptionTurnSettlementTimeout)
+	defer cancel()
+	if err := billing.WaitForSubscriptionCacheWrites(settleCtx, userID, groupID); err != nil {
+		logger.LegacyPrintf("handler.openai_gateway", "Warning: wait for subscription cache writes failed for user %d group %d: %v", userID, groupID, err)
+	}
+	// The asynchronous cache update is useful to all normal request paths, but
+	// this turn is about to release an admission lease. Dropping the snapshot
+	// makes the next guarded WebSocket turn reload the durable post-billing
+	// totals instead of relying on a stale read after an unusual worker failure.
+	if err := billing.InvalidateSubscription(settleCtx, userID, groupID); err != nil {
+		logger.LegacyPrintf("handler.openai_gateway", "Warning: invalidate subscription cache after WebSocket turn failed for user %d group %d: %v", userID, groupID, err)
+	}
+}
 
 func newOpenAIWSUnsupportedModelSwitchError(model string) error {
 	cause := fmt.Errorf("%w: model %q", errOpenAIWSUnsupportedModelSwitch, strings.TrimSpace(model))
@@ -86,6 +268,22 @@ func openAIWSTurnBillingModel(result *service.OpenAIForwardResult, mapping servi
 		}
 	}
 	return billingModel
+}
+
+func (h *OpenAIGatewayHandler) checkOpenAIWSBillingEligibility(
+	ctx context.Context,
+	c *gin.Context,
+	apiKey *service.APIKey,
+	subscription *service.UserSubscription,
+) error {
+	return h.billingCacheService.CheckBillingEligibility(
+		ctx,
+		apiKey.User,
+		apiKey,
+		apiKey.Group,
+		subscription,
+		service.QuotaPlatform(c.Request.Context(), apiKey),
+	)
 }
 
 type grokMediaEligibilityProber interface {
@@ -188,9 +386,8 @@ func openAIResponsesRequiredCapability(imageIntent bool, platform string) servic
 	return service.OpenAIEndpointCapabilityChatCompletions
 }
 
-// openAIResponsesRequiredCapabilityForRequest returns the endpoint capability
-// required by an image or Responses request. needsResponses includes both the
-// legacy /responses/compact endpoint and native remote compaction v2.
+// openAIResponsesRequiredCapabilityForRequest covers native remote compaction
+// v2 as well as the legacy /responses/compact endpoint.
 func openAIResponsesRequiredCapabilityForRequest(imageIntent bool, needsResponses bool, platform string) service.OpenAIEndpointCapability {
 	if needsResponses && platform == service.PlatformOpenAI {
 		return service.OpenAIEndpointCapabilityResponses
@@ -336,7 +533,7 @@ func (h *OpenAIGatewayHandler) Responses(c *gin.Context) {
 		return
 	}
 	legacyCompact := service.IsOpenAIResponsesCompactPath(c)
-	nativeV2 := isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2Request(body)
+	nativeV2 := isBareOpenAIResponsesPath(c) && isOpenAIRemoteCompactionV2RequestForContext(c, body)
 	if nativeV2 {
 		// 原生 v2 压缩出站前补注 x-codex-beta-features: remote_compaction_v2，
 		// 与真实 Codex 线型一致（网关链剥头后本级负责恢复，#5586）。
@@ -832,6 +1029,25 @@ func isOpenAIRemoteCompactionV2Request(body []byte) bool {
 	return valid && stream && service.HasCompactionTriggerInInput(body)
 }
 
+// isOpenAIRemoteCompactionV2RequestForContext keeps the hop-by-hop beta
+// negotiation authoritative while allowing the documented Codex Desktop
+// fallback when an earlier gateway stripped that header. Legacy CLI and
+// unknown clients must continue using the /responses/compact bridge.
+func isOpenAIRemoteCompactionV2RequestForContext(c *gin.Context, body []byte) bool {
+	if !isOpenAIRemoteCompactionV2Request(body) || c == nil || c.Request == nil {
+		return false
+	}
+	for _, value := range c.Request.Header.Values("x-codex-beta-features") {
+		for _, token := range strings.Split(value, ",") {
+			if strings.TrimSpace(token) == "remote_compaction_v2" {
+				return true
+			}
+		}
+	}
+	ua := strings.TrimSpace(c.Request.Header.Get("User-Agent"))
+	return len(ua) > len("Codex Desktop/") && strings.HasPrefix(strings.ToLower(ua), "codex desktop/")
+}
+
 // normalizeOpenAIResponsesCompactRequest keeps Codex remote compaction v2 on
 // its native streaming /responses wire and preserves the legacy body-signal
 // promotion for non-streaming requests.
@@ -839,7 +1055,7 @@ func isOpenAIRemoteCompactionV2Request(body []byte) bool {
 func (h *OpenAIGatewayHandler) normalizeOpenAIResponsesCompactRequest(c *gin.Context, reqLog *zap.Logger, body []byte) ([]byte, bool) {
 	isCompactRequest := isOpenAILegacyCompactPath(c)
 	if !isCompactRequest && isBareOpenAIResponsesPath(c) && service.HasCompactionTriggerInInput(body) {
-		if isOpenAIRemoteCompactionV2Request(body) {
+		if isOpenAIRemoteCompactionV2RequestForContext(c, body) {
 			return body, true
 		}
 		c.Request.URL.Path = strings.TrimRight(c.Request.URL.Path, "/") + "/compact"
@@ -1771,7 +1987,63 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "invalid JSON payload")
 		return
 	}
+	preludeCtx, cancelPreludeRead := context.WithTimeout(ctx, firstMessageTimeout)
+	defer cancelPreludeRead()
+	initialPassthroughFrames := make([]service.OpenAIWSPassthroughInitialFrame, 0, 4)
+	initialPassthroughBytes := 0
+	for strings.TrimSpace(gjson.GetBytes(firstMessage, "type").String()) != "response.create" {
+		frameType := strings.TrimSpace(gjson.GetBytes(firstMessage, "type").String())
+		if frameType != "conversation.item.create" && frameType != "session.update" {
+			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "first websocket frame sequence must reach response.create")
+			return
+		}
+		if len(initialPassthroughFrames) >= 128 || initialPassthroughBytes+len(firstMessage) > 4*1024*1024 {
+			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "websocket prelude is too large")
+			return
+		}
+		initialPassthroughFrames = append(initialPassthroughFrames, service.OpenAIWSPassthroughInitialFrame{
+			MessageType: msgType,
+			Payload:     append([]byte(nil), firstMessage...),
+		})
+		initialPassthroughBytes += len(firstMessage)
+		msgType, firstMessage, err = service.ReadOpenAIWSClientMessage(
+			preludeCtx,
+			wsConn,
+			firstMessageTimeout,
+			coderws.StatusPolicyViolation,
+			"missing response.create after websocket prelude",
+		)
+		if err != nil {
+			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "missing response.create after websocket prelude")
+			return
+		}
+		if msgType != coderws.MessageText && msgType != coderws.MessageBinary {
+			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "unsupported websocket message type")
+			return
+		}
+		if !gjson.ValidBytes(firstMessage) {
+			closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "invalid JSON payload")
+			return
+		}
+	}
+	auditFirstMessage, auditFirstErr := service.BuildOpenAIWSPassthroughInitialAuditPayload(firstMessage, initialPassthroughFrames)
+	if auditFirstErr != nil {
+		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "invalid websocket prelude")
+		return
+	}
 	reqModel := strings.TrimSpace(gjson.GetBytes(firstMessage, "model").String())
+	if reqModel == "" {
+		for i := len(initialPassthroughFrames) - 1; i >= 0 && reqModel == ""; i-- {
+			frame := initialPassthroughFrames[i]
+			if strings.TrimSpace(gjson.GetBytes(frame.Payload, "type").String()) != "session.update" {
+				continue
+			}
+			reqModel = strings.TrimSpace(gjson.GetBytes(frame.Payload, "session.model").String())
+			if reqModel == "" {
+				reqModel = strings.TrimSpace(gjson.GetBytes(frame.Payload, "model").String())
+			}
+		}
+	}
 	if reqModel == "" {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "model is required in first response.create payload")
 		return
@@ -1791,7 +2063,7 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "previous_response_id must be a response.id (resp_*), not a message id")
 		return
 	}
-	firstMessageToolCoverage := service.AnalyzeToolCallOutputContextCoverageBytes(firstMessage)
+	firstMessageToolCoverage := service.AnalyzeToolCallOutputContextCoverageBytes(auditFirstMessage)
 	previousResponseCanMove := !firstMessageToolCoverage.HasFunctionCallOutput || firstMessageToolCoverage.ContextCoversAllCallIDs
 	reqLog = reqLog.With(
 		zap.Bool("ws_ingress", true),
@@ -1802,13 +2074,13 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	setOpsRequestContext(c, reqModel, true)
 	setOpsEndpointContext(c, "", int16(service.RequestTypeWSV2))
 
-	if decision := h.checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, reqModel, firstMessage, "first_turn"); decision != nil && !decision.AllowNextStage {
+	if decision := h.checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, reqModel, auditFirstMessage, "first_turn"); decision != nil && !decision.AllowNextStage {
 		writeSecurityAuditWSError(ctx, wsConn, decision)
 		closeOpenAIClientWS(wsConn, securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision))
 		return
 	}
 
-	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage)
+	imageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, auditFirstMessage)
 	if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, service.ImageGenerationPermissionMessage())
 		return
@@ -1876,22 +2148,64 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	}
 
 	subscription, _ := middleware2.GetSubscriptionFromContext(c)
+	subscriptionTurnLeases := newOpenAIWSSubscriptionTurnLeaseState()
+	defer subscriptionTurnLeases.abortUnsettled()
+	subscriptionTurnLeaseConfigured := apiKey != nil && apiKey.User != nil && apiKey.Group != nil &&
+		apiKey.Group.IsSubscriptionType() && subscription != nil
+	subscriptionTurnLeaseEnabled := subscriptionTurnLeaseConfigured
+	subscriptionTurnGroupID := int64(0)
+	if apiKey != nil && apiKey.GroupID != nil {
+		subscriptionTurnGroupID = *apiKey.GroupID
+	} else if apiKey != nil && apiKey.Group != nil {
+		subscriptionTurnGroupID = apiKey.Group.ID
+	}
+	admitSubscriptionTurn := func(turn int) (bool, error) {
+		if !subscriptionTurnLeaseEnabled {
+			return true, h.checkOpenAIWSBillingEligibility(ctx, c, apiKey, subscription)
+		}
+		acquired, err := subscriptionTurnLeases.acquire(
+			ctx,
+			h.billingCacheService,
+			apiKey.User.ID,
+			subscriptionTurnGroupID,
+			turn,
+		)
+		if err != nil || !acquired {
+			return acquired, err
+		}
+		if err := h.checkOpenAIWSBillingEligibility(ctx, c, apiKey, subscription); err != nil {
+			subscriptionTurnLeases.releaseTurn(turn)
+			return true, err
+		}
+		return true, nil
+	}
 	requestPlatform := openAICompatibleRequestPlatform(ctx, apiKey)
+	// The turn lease is an OpenAI subscription safeguard. Keep the existing
+	// Grok/other-compatible WebSocket paths unchanged, including their normal
+	// per-turn billing behavior.
+	subscriptionTurnLeaseEnabled = openAIWSSubscriptionTurnLeaseEnabled(subscriptionTurnLeaseConfigured, requestPlatform, h.cfg)
 	requiredTransport := service.OpenAIUpstreamTransportResponsesWebsocketV2Ingress
 	if requestPlatform == service.PlatformGrok {
 		requiredTransport = service.OpenAIUpstreamTransportHTTPSSE
 	}
-	if err := h.billingCacheService.CheckBillingEligibility(ctx, apiKey.User, apiKey, apiKey.Group, subscription, service.QuotaPlatform(c.Request.Context(), apiKey)); err != nil {
+	if admitted, err := admitSubscriptionTurn(1); err != nil {
 		reqLog.Info("openai.websocket_billing_eligibility_check_failed", zap.Error(err))
 		closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
 		return
+	} else if !admitted {
+		reqLog.Info("openai.websocket_subscription_turn_busy")
+		closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "subscription usage is being finalized, please retry shortly")
+		return
 	}
 
-	sessionHash := h.gatewayService.GenerateSessionHashWithFallback(
-		c,
-		firstMessage,
-		openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID),
-	)
+	// A WebSocket without an explicit session signal gets a per-connection
+	// fallback. Content/model-only frames are not stable conversation IDs and
+	// must never reuse another client's local upstream socket.
+	sessionHash := h.gatewayService.GenerateExplicitSessionHash(c, firstMessage)
+	if sessionHash == "" {
+		fallbackSeed := openAIWSIngressFallbackSessionSeed(subject.UserID, apiKey.ID, apiKey.GroupID) + ":" + uuid.NewString()
+		sessionHash = h.gatewayService.GenerateSessionHashWithFallback(c, nil, fallbackSeed)
+	}
 	maxAccountSwitches := h.maxAccountSwitches
 	switchCount := 0
 	profitVetoCount := 0
@@ -1945,6 +2259,124 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 	if service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage) && requestPlatform == service.PlatformOpenAI {
 		requiredCapability = service.OpenAIEndpointCapabilityResponses
 	}
+	applyWSCurrentTurnRetryPayload := func(retryPayload []byte) bool {
+		payload, model, coverage, ok := openAIWSCurrentTurnRetryPayloadState(retryPayload)
+		if !ok {
+			return false
+		}
+
+		nextCtx := ctx
+		nextRequestCtx := c.Request.Context()
+		if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
+			platform, detected := service.DetectModelPlatform(model)
+			if !detected || !isResponsesWebSocketCompositePlatform(platform) {
+				return false
+			}
+			// ensureCompositeTargetPlatform intentionally preserves an existing
+			// target. A current-turn replay may legitimately change models, so
+			// replace the composite target rather than retaining the first turn's.
+			nextCtx = service.WithResolvedTargetPlatform(nextCtx, platform)
+			nextRequestCtx = service.WithResolvedTargetPlatform(nextRequestCtx, platform)
+		}
+
+		nextPlatform := openAICompatibleRequestPlatform(nextCtx, apiKey)
+		nextImageIntent := service.IsExplicitImageGenerationIntent("/v1/responses", model, payload)
+		if nextImageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
+			return false
+		}
+		nextTransport := service.OpenAIUpstreamTransportResponsesWebsocketV2Ingress
+		if nextPlatform == service.PlatformGrok {
+			nextTransport = service.OpenAIUpstreamTransportHTTPSSE
+		}
+		nextCapability := service.OpenAIEndpointCapabilityChatCompletions
+		if nextImageIntent && nextPlatform == service.PlatformOpenAI {
+			nextCapability = service.OpenAIEndpointCapabilityResponses
+		}
+		nextChannelMapping, _ := h.gatewayService.ResolveChannelMappingAndRestrict(nextCtx, apiKey.GroupID, model)
+
+		firstMessage = append([]byte(nil), payload...)
+		wsAttemptMessage = append([]byte(nil), payload...)
+		reqModel = model
+		previousResponseID = ""
+		previousResponseIDKind = service.OpenAIPreviousResponseIDKindEmpty
+		firstMessageToolCoverage = coverage
+		previousResponseCanMove = true
+		imageIntent = nextImageIntent
+		requestPlatform = nextPlatform
+		subscriptionTurnLeaseEnabled = openAIWSSubscriptionTurnLeaseEnabled(subscriptionTurnLeaseConfigured, nextPlatform, h.cfg)
+		requiredTransport = nextTransport
+		requiredCapability = nextCapability
+		channelMappingWS = nextChannelMapping
+		ctx = nextCtx
+		c.Request = c.Request.WithContext(nextRequestCtx)
+		setOpsRequestContext(c, reqModel, true)
+		return true
+	}
+	applyWSResume := func(resume *service.OpenAIWSResumeState) bool {
+		if resume == nil || len(resume.ReplayPayload) == 0 {
+			return false
+		}
+		if resume.SessionHash != "" && resume.SessionHash != sessionHash {
+			return false
+		}
+		model := strings.TrimSpace(resume.OriginalModel)
+		if model == "" {
+			return false
+		}
+		payload := append([]byte(nil), resume.ReplayPayload...)
+		if !gjson.ValidBytes(payload) || strings.TrimSpace(gjson.GetBytes(payload, "previous_response_id").String()) != "" {
+			return false
+		}
+		var setModelErr error
+		payload, setModelErr = sjson.SetBytes(payload, "model", model)
+		if setModelErr != nil {
+			return false
+		}
+		coverage := service.AnalyzeToolCallOutputContextCoverageBytes(payload)
+		if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
+			return false
+		}
+
+		firstMessage = append([]byte(nil), payload...)
+		// The failover loop sends wsAttemptMessage, not firstMessage. Keep both
+		// snapshots aligned so a verified guard resume reaches the replacement
+		// account without the old previous_response_id.
+		wsAttemptMessage = append([]byte(nil), payload...)
+		reqModel = model
+		previousResponseID = ""
+		previousResponseIDKind = service.OpenAIPreviousResponseIDKindEmpty
+		firstMessageToolCoverage = coverage
+		previousResponseCanMove = true
+		imageIntent = service.IsExplicitImageGenerationIntent("/v1/responses", reqModel, firstMessage)
+		if imageIntent && !service.GroupAllowsImageGeneration(apiKey.Group) {
+			return false
+		}
+		if apiKey.Group != nil && apiKey.Group.Platform == service.PlatformComposite {
+			platform, ok := service.DetectModelPlatform(reqModel)
+			if !ok || platform != service.PlatformOpenAI {
+				return false
+			}
+			ctx = service.WithResolvedTargetPlatform(ctx, platform)
+			c.Request = c.Request.WithContext(service.WithResolvedTargetPlatform(c.Request.Context(), platform))
+		}
+		requestPlatform = openAICompatibleRequestPlatform(ctx, apiKey)
+		if requestPlatform != service.PlatformOpenAI {
+			return false
+		}
+		requiredTransport = service.OpenAIUpstreamTransportResponsesWebsocketV2Ingress
+		requiredCapability = service.OpenAIEndpointCapabilityChatCompletions
+		if imageIntent {
+			requiredCapability = service.OpenAIEndpointCapabilityResponses
+		}
+		channelMappingWS, _ = h.gatewayService.ResolveChannelMappingAndRestrict(ctx, apiKey.GroupID, reqModel)
+		setOpsRequestContext(c, reqModel, true)
+		reqLog.Warn("openai.websocket_429_guard_resuming_turn",
+			zap.Int("turn", resume.Turn),
+			zap.Int64("failed_account_id", resume.FailedAccountID),
+			zap.String("failed_conn_id", resume.FailedConnID),
+		)
+		return true
+	}
 
 	// 分组利润控制：WS 桥按连接装配定价上下文并装门（选号与抢槽共用该
 	// ctx）。连接内不重选号，但每个 turn 开始经 BeforeTurn 重新冻结 pricingAt
@@ -1995,6 +2427,27 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		}
 
 		account := selection.Account
+		passthroughMode := false
+		if account.Platform != service.PlatformGrok && h.cfg != nil && h.cfg.Gateway.OpenAIWS.ModeRouterV2Enabled {
+			passthroughMode = account.ResolveOpenAIResponsesWebSocketV2Mode(h.cfg.Gateway.OpenAIWS.IngressModeDefault) == service.OpenAIWSIngressModePassthrough
+		}
+		if len(initialPassthroughFrames) > 0 && !passthroughMode {
+			// Pool/bridge relays accept one request payload rather than arbitrary
+			// prelude frames. Preserve staged conversation content by folding it
+			// into that first payload instead of silently dropping it; only the
+			// direct passthrough adapter forwards the original frame sequence.
+			mergedFirst, mergeErr := service.MergeOpenAIWSPassthroughInitialPayload(firstMessage, initialPassthroughFrames)
+			if mergeErr != nil {
+				closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "invalid websocket prelude")
+				return
+			}
+			firstMessage = mergedFirst
+			// Retry attempts must use the same merged prelude payload as the
+			// first attempt. Keeping the pre-merge frame here drops client state
+			// after an account failover.
+			wsAttemptMessage = append([]byte(nil), mergedFirst...)
+			initialPassthroughFrames = nil
+		}
 		accountMaxConcurrency := account.Concurrency
 		if selection.WaitPlan != nil && selection.WaitPlan.MaxConcurrency > 0 {
 			accountMaxConcurrency = selection.WaitPlan.MaxConcurrency
@@ -2116,13 +2569,60 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 		// turn 级定价：BeforeTurn 重新冻结 pricingAt 并按最新门复核当前账号；
 		// passthrough 没有 BeforeTurn 时，AfterTurn 回退到 TurnStarted 的所属 turn 时刻。
 		var turnPricing openAIWSTurnPricing
+		reacquirePassthroughTurnSlots := func(turn int) error {
+			// The initial turn keeps the handler's admission slots. Later
+			// passthrough turns run after AfterTurn released them, and must not
+			// bypass either user or account concurrency limits.
+			if turn <= 1 || (currentUserRelease != nil && currentAccountRelease != nil) {
+				return nil
+			}
+
+			acquiredUserNow := false
+			if currentUserRelease == nil {
+				userReleaseFunc, userAcquired, acquireErr := h.concurrencyHelper.TryAcquireUserSlotForAPIKey(ctx, subject.UserID, subject.Concurrency, apiKey.ID)
+				if acquireErr != nil {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire user concurrency slot", acquireErr)
+				}
+				if !userAcquired {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "too many concurrent requests, please retry later", nil)
+				}
+				currentUserRelease = wrapReleaseOnDone(ctx, userReleaseFunc)
+				acquiredUserNow = true
+			}
+
+			if currentAccountRelease != nil {
+				return nil
+			}
+			accountReleaseFunc, accountAcquired, acquireErr := h.concurrencyHelper.TryAcquireAccountSlot(ctx, account.ID, accountMaxConcurrency)
+			if acquireErr != nil {
+				if acquiredUserNow {
+					currentUserRelease()
+					currentUserRelease = nil
+				}
+				return service.NewOpenAIWSClientCloseError(coderws.StatusInternalError, "failed to acquire account concurrency slot", acquireErr)
+			}
+			if !accountAcquired {
+				if acquiredUserNow {
+					currentUserRelease()
+					currentUserRelease = nil
+				}
+				return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "account is busy, please retry later", nil)
+			}
+			currentAccountRelease = wrapReleaseOnDone(ctx, accountReleaseFunc)
+			return nil
+		}
 		hooks := &service.OpenAIWSIngressHooks{
-			ClientLifecycleContext:  clientLifecycleCtx,
-			InitialRequestModel:     reqModel,
-			InitialTurnStartedAt:    firstTurnStartedAt,
-			MaxReasoningEffort:      maxReasoningEffort,
-			ReasoningEffortMappings: reasoningEffortMappings,
-			TurnStarted:             recordTurnStart,
+			ClientLifecycleContext:     clientLifecycleCtx,
+			InitialRequestModel:        reqModel,
+			InitialTurnStartedAt:       firstTurnStartedAt,
+			InitialPassthroughFrames:   initialPassthroughFrames,
+			InitialResponseMessageType: msgType,
+			SessionHash:                sessionHash,
+			Force429GuardContinuation:  scheduleDecision.ContinuationLease,
+			MaxReasoningEffort:         maxReasoningEffort,
+			ReasoningEffortMappings:    reasoningEffortMappings,
+			TurnStarted:                recordTurnStart,
+			BeforePassthroughTurn:      reacquirePassthroughTurnSlots,
 			BeforeRequest: func(turn int, payload []byte, originalModel string) error {
 				c.Set(securityAuditWSTurnContextKey, turn)
 				if turn == 1 {
@@ -2141,6 +2641,26 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				if decision := h.checkSecurityAuditStage(c, reqLog, apiKey, subject, service.ContentModerationProtocolOpenAIResponses, model, payload, "subsequent_turn"); decision != nil && !decision.AllowNextStage {
 					writeSecurityAuditWSError(ctx, wsConn, decision)
 					return service.NewOpenAIWSClientCloseError(securityAuditWSCloseStatus(decision), securityAuditWSCloseReason(decision), nil)
+				}
+				// A long-lived socket must not retain the admission decision made at
+				// handshake. Passthrough mode intentionally skips BeforeTurn, so this
+				// hook is the shared per-turn billing gate for every ingress mode. The
+				// subscription lease is acquired before the read and held until the
+				// corresponding usage task settles.
+				admitted, err := admitSubscriptionTurn(turn)
+				if err != nil {
+					reqLog.Info("openai.websocket_turn_billing_eligibility_check_failed",
+						zap.Int("turn", turn),
+						zap.Error(err),
+					)
+					status := coderws.StatusPolicyViolation
+					if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+						status = coderws.StatusTryAgainLater
+					}
+					return service.NewOpenAIWSClientCloseError(status, "billing check failed", err)
+				}
+				if !admitted {
+					return service.NewOpenAIWSClientCloseError(coderws.StatusTryAgainLater, "subscription usage is being finalized, please retry shortly", nil)
 				}
 				return nil
 			},
@@ -2213,6 +2733,12 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				// CyberBlocked 必须在 submit 前同步预捕获（task 闭包由 worker 池异步执行，
 				// 届时 defer 已清除标记）。
 				defer clearCyberPolicyTurnState(c)
+				settlementOwned := false
+				defer func() {
+					if !settlementOwned {
+						subscriptionTurnLeases.releaseTurn(turn)
+					}
+				}()
 				releaseTurnSlots()
 				turnRequestedModel := reqModel
 				turnUpstreamModel := ""
@@ -2278,7 +2804,17 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 				sessionID := service.ExtractClientSessionID(c)
 				turnRecordPricingAt := turnPricing.currentOr(turnStart)
 				cyberBlocked := service.GetOpsCyberPolicy(c) != nil
-				h.submitOpenAIUsageRecordTask(ctx, result, func(taskCtx context.Context) {
+				turnLease := subscriptionTurnLeases.beginSettlement(turn)
+				settlementOwned = turnLease != nil
+				recordUsage := func(taskCtx context.Context) {
+					if turnLease != nil {
+						defer subscriptionTurnLeases.settleAfterUsage(
+							turnLease,
+							h.billingCacheService,
+							apiKey.User.ID,
+							subscriptionTurnGroupID,
+						)
+					}
 					if err := h.gatewayService.RecordUsage(taskCtx, &service.OpenAIRecordUsageInput{
 						Result:             result,
 						APIKey:             apiKey,
@@ -2303,27 +2839,55 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 							zap.Error(err),
 						)
 					}
-				})
+				}
+				if turnLease != nil {
+					// A lease holder must never use the optional drop/sample path:
+					// releasing it before the bill is persisted would reopen the
+					// very TOCTOU window this guard closes.
+					h.submitMandatoryUsageRecordTask(ctx, recordUsage)
+				} else {
+					h.submitOpenAIUsageRecordTask(ctx, result, recordUsage)
+				}
 			},
 		}
 
 		wsFirstMessage := wsAttemptMessage
-		// 切组/会话失配防护：previous_response_id 未在当前分组命中粘连账号（StickyPreviousHit=false），
-		// 说明该会话链不属于本次调度到的账号，原样转发会触发上游会话链鉴权失败（“鉴权失败，请检查 API Key”）。
-		// 故剥离首包里的 previous_response_id，改用首包内 input 重建上下文；带 function_call_output 的
-		// 工具续链无法重建，保持原样。仅作用于首轮首包，后续 turn 的续链由 WS 转发层既有逻辑处理。
-		if previousResponseID != "" && !scheduleDecision.StickyPreviousHit && previousResponseCanMove {
-			wsFirstMessage = service.RemovePreviousResponseIDFromBody(wsFirstMessage)
-			reqLog.Debug("openai.websocket_previous_response_id_stripped_cross_group",
+		// A previous_response_id is scoped to the upstream account/session that
+		// created it. If the scheduler cannot prove the response binding belongs
+		// to the selected account, stripping the id would turn a continuation
+		// delta into a new, contextless request. Keep the conversation intact and
+		// fail closed; only the explicit WS resume path may rebuild a full payload.
+		if previousResponseID != "" && !scheduleDecision.StickyPreviousHit {
+			reqLog.Warn("openai.websocket_previous_response_binding_unavailable",
 				zap.Int64("account_id", account.ID),
 				zap.String("schedule_layer", scheduleDecision.Layer),
 			)
+			closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation binding unavailable; please reconnect")
+			return
+		}
+		// A first-turn failover can release its original lease before the next
+		// account attempt. Re-admit only in that case; a healthy first attempt
+		// already performed the normal handshake check and must not count twice.
+		if subscriptionTurnLeaseEnabled && !subscriptionTurnLeases.hasTurn(1) {
+			if admitted, err := admitSubscriptionTurn(1); err != nil {
+				reqLog.Info("openai.websocket_retry_billing_eligibility_check_failed", zap.Error(err))
+				closeOpenAIClientWS(wsConn, coderws.StatusPolicyViolation, "billing check failed")
+				return
+			} else if !admitted {
+				closeOpenAIClientWS(wsConn, coderws.StatusTryAgainLater, "subscription usage is being finalized, please retry shortly")
+				return
+			}
 		}
 
 		// WebSocket 首包可能很大，hash 必须在 hooks 外算成字符串，避免 AfterTurn 闭包保活请求体。
 		requestPayloadHash = service.HashUsageRequestPayload(wsFirstMessage)
 
 		if err := h.gatewayService.ProxyResponsesWebSocketFromClient(ctx, c, wsConn, account, token, wsFirstMessage, hooks); err != nil {
+			// Some dial/handshake failures happen before the relay can invoke
+			// AfterTurn. Release only an unsettled lease here; a completed turn
+			// keeps its lease until its background bill has reached the cache
+			// barrier, even if the socket subsequently fails.
+			subscriptionTurnLeases.abortUnsettled()
 			var failoverErr *service.UpstreamFailoverError
 			if errors.As(err, &failoverErr) {
 				retryPayload, retryCurrentTurn := service.OpenAIWSCurrentTurnRetryPayload(err)
@@ -2332,16 +2896,32 @@ func (h *OpenAIGatewayHandler) ResponsesWebSocket(c *gin.Context) {
 					closeOpenAIWSFailoverExhausted(wsConn, failoverErr)
 					return
 				}
-				wsAttemptMessage = nextAttemptMessage
 				if retryCurrentTurn {
-					previousResponseID = ""
+					if !applyWSCurrentTurnRetryPayload(nextAttemptMessage) {
+						closeOpenAIWSFailoverExhausted(wsConn, failoverErr)
+						return
+					}
 					reqLog.Warn("openai.websocket_current_turn_failover_retry",
 						zap.Int64("account_id", account.ID),
 						zap.Int("upstream_status", failoverErr.StatusCode),
 						zap.Int("retry_payload_bytes", len(retryPayload)),
 					)
+				} else {
+					wsAttemptMessage = nextAttemptMessage
 				}
 				if handleWSFailover(account, failoverErr) {
+					if failoverErr.WSResume != nil {
+						if !applyWSResume(failoverErr.WSResume) {
+							closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation could not be safely resumed; please reconnect")
+							return
+						}
+					} else if strings.TrimSpace(previousResponseID) != "" {
+						// A raw previous_response_id is only meaningful to the old
+						// upstream account. Do not strip it and send a delta-only
+						// request to a replacement account without a verified replay.
+						closeOpenAIClientWS(wsConn, coderws.StatusGoingAway, "upstream continuation could not be safely resumed; please reconnect")
+						return
+					}
 					continue
 				}
 				return
@@ -2991,6 +3571,36 @@ func openAIWSNextAttemptMessage(current, retryPayload []byte, retryCurrentTurn b
 		return nil, false
 	}
 	return append([]byte(nil), retryPayload...), true
+}
+
+// openAIWSCurrentTurnRetryPayloadState validates the full replay payload that
+// the HTTP bridge creates for a later failed turn. The model belongs to this
+// payload, not to the connection's first response.create frame.
+func openAIWSCurrentTurnRetryPayloadState(payload []byte) ([]byte, string, service.ToolCallOutputContextCoverage, bool) {
+	if !gjson.ValidBytes(payload) {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	if messageType := strings.TrimSpace(gjson.GetBytes(payload, "type").String()); messageType != "response.create" {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	model := gjson.GetBytes(payload, "model")
+	if !model.Exists() || model.Type != gjson.String || strings.TrimSpace(model.String()) == "" {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	coverage := service.AnalyzeToolCallOutputContextCoverageBytes(payload)
+	if coverage.HasFunctionCallOutput && !coverage.ContextCoversAllCallIDs {
+		return nil, "", service.ToolCallOutputContextCoverage{}, false
+	}
+	return append([]byte(nil), payload...), strings.TrimSpace(model.String()), coverage, true
+}
+
+func openAIWSSubscriptionTurnLeaseEnabled(configured bool, platform string, cfg *config.Config) bool {
+	if !configured || platform != service.PlatformOpenAI {
+		return false
+	}
+	// Simple mode intentionally bypasses billing and quota enforcement; do not
+	// introduce a distributed admission dependency into that mode.
+	return cfg == nil || cfg.RunMode != config.RunModeSimple
 }
 
 func closeOpenAIWSFailoverExhausted(conn *coderws.Conn, failoverErr *service.UpstreamFailoverError) {
